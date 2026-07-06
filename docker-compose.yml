@@ -8,7 +8,9 @@ services:
     container_name: libredesk_app
     restart: unless-stopped
     ports:
-      - "9000:9000"
+      # Bind to localhost by default. Set LIBREDESK_HOST_BIND_IP to a private
+      # proxy-facing address when exposing through an ingress/reverse proxy.
+      - "${LIBREDESK_HOST_BIND_IP:-127.0.0.1}:9000:9000"
     environment:
       # If the password is set during first docker-compose up, the system user password will be set to this value.
       # You can always set system user password later by running `docker exec -it libredesk_app ./libredesk --set-system-user-password`.
