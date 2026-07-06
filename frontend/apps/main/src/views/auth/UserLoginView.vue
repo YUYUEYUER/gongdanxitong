@@ -90,9 +90,22 @@
             </router-link>
           </div>
 
+          <div v-if="turnstileEnabled" class="space-y-2">
+            <Label class="text-muted-foreground">{{ t('auth.turnstileLabel') }}</Label>
+            <TurnstileField
+              ref="turnstileRef"
+              v-model="turnstileToken"
+              :site-key="turnstileSiteKey"
+              action="admin_login"
+              @error="handleTurnstileError"
+              @expired="handleTurnstileExpired"
+            />
+            <p v-if="turnstileError" class="text-xs text-destructive">{{ turnstileError }}</p>
+          </div>
+
           <Button
             class="w-full"
-            :disabled="isLoading"
+            :disabled="isLoading || (turnstileEnabled && !turnstileVerified)"
             type="submit"
           >
             <span v-if="isLoading" class="flex items-center justify-center">
@@ -117,7 +130,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import api from '../../api'
@@ -134,6 +147,7 @@ import { useI18n } from 'vue-i18n'
 import { EMITTER_EVENTS } from '../../constants/emitterEvents.js'
 import { useAppSettingsStore } from '../../stores/appSettings'
 import AuthLayout from '@/layouts/auth/AuthLayout.vue'
+import TurnstileField from '@/components/TurnstileField.vue'
 import { Eye, EyeOff } from 'lucide-vue-next'
 
 const emitter = useEmitter()
@@ -144,12 +158,20 @@ const router = useRouter()
 const userStore = useUserStore()
 const shakeCard = ref(false)
 const showPassword = ref(false)
+const turnstileRef = ref(null)
+const turnstileToken = ref('')
+const turnstileVerified = ref(false)
+const turnstileError = ref('')
 const loginForm = ref({
   email: '',
   password: ''
 })
 const oidcProviders = ref([])
 const appSettingsStore = useAppSettingsStore()
+const turnstileEnabled = computed(() => !!appSettingsStore.public_config?.['app.turnstile_enabled'])
+const turnstileSiteKey = computed(
+  () => appSettingsStore.public_config?.['app.turnstile_site_key'] || ''
+)
 
 // Demo build has the credentials prefilled.
 const isDemoBuild = import.meta.env.VITE_DEMO_BUILD === 'true'
@@ -191,6 +213,25 @@ const redirectToOIDC = (provider) => {
   window.location.href = url
 }
 
+watch(turnstileToken, (token) => {
+  turnstileVerified.value = !!token
+  if (token) {
+    turnstileError.value = ''
+  }
+})
+
+function handleTurnstileError() {
+  turnstileToken.value = ''
+  turnstileVerified.value = false
+  turnstileError.value = t('auth.turnstileLoadFailed')
+}
+
+function handleTurnstileExpired() {
+  turnstileToken.value = ''
+  turnstileVerified.value = false
+  turnstileError.value = t('auth.turnstileExpired')
+}
+
 const validateForm = () => {
   if (!validateEmail(loginForm.value.email) && loginForm.value.email !== 'System') {
     errorMessage.value = t('validation.invalidEmail')
@@ -199,6 +240,11 @@ const validateForm = () => {
   }
   if (!loginForm.value.password) {
     errorMessage.value = t('validation.passwordCannotBeEmpty')
+    useTemporaryClass('login-container', 'animate-shake')
+    return false
+  }
+  if (turnstileEnabled.value && !turnstileVerified.value) {
+    turnstileError.value = t('auth.turnstileRequired')
     useTemporaryClass('login-container', 'animate-shake')
     return false
   }
@@ -214,7 +260,8 @@ const loginAction = () => {
   api
     .login({
       email: loginForm.value.email,
-      password: loginForm.value.password
+      password: loginForm.value.password,
+      'cf-turnstile-response': turnstileToken.value
     })
     .then((resp) => {
       if (resp?.data?.data) {
@@ -233,6 +280,8 @@ const loginAction = () => {
     })
     .catch((error) => {
       errorMessage.value = handleHTTPError(error).message
+      turnstileVerified.value = false
+      turnstileRef.value?.reset()
       useTemporaryClass('login-container', 'animate-shake')
     })
     .finally(() => {

@@ -1,16 +1,30 @@
 package main
 
 import (
+	"strings"
+
 	amodels "github.com/abhinavxd/libredesk/internal/auth/models"
 	"github.com/abhinavxd/libredesk/internal/envelope"
+	turnstilesvc "github.com/abhinavxd/libredesk/internal/turnstile"
 	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
 
 type loginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email               string `json:"email"`
+	Password            string `json:"password"`
+	CFTurnstileResponse string `json:"cf-turnstile-response"`
+	TurnstileToken      string `json:"turnstile_token"`
+}
+
+const turnstileActionAdminLogin = "admin_login"
+
+func (req loginRequest) turnstileResponse() string {
+	if strings.TrimSpace(req.CFTurnstileResponse) != "" {
+		return strings.TrimSpace(req.CFTurnstileResponse)
+	}
+	return strings.TrimSpace(req.TurnstileToken)
 }
 
 // handleLogin logs in the user and returns the user.
@@ -25,9 +39,22 @@ func handleLogin(r *fastglue.Request) error {
 	if err := r.Decode(&loginReq, "json"); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
 	}
+	loginReq.Email = strings.TrimSpace(loginReq.Email)
 
 	if loginReq.Email == "" || loginReq.Password == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.badRequest"), nil, envelope.InputError)
+	}
+	userAgent := string(r.RequestCtx.UserAgent())
+
+	if err := validateTurnstileToken(r, loginReq.turnstileResponse(), turnstilesvc.WithExpectedAction(turnstileActionAdminLogin)); err != nil {
+		app.lo.Warn(
+			"admin login turnstile failed",
+			"ip", ip,
+			"user_agent", userAgent,
+			"email_hash", sha256Hex(strings.ToLower(loginReq.Email)),
+			"error", err,
+		)
+		return sendErrorEnvelope(r, err)
 	}
 
 	// Verify email and password.

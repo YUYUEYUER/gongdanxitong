@@ -127,6 +127,17 @@ func TestCustomerRegisterRequestTurnstileResponse(t *testing.T) {
 	require.Equal(t, "legacy-token", req.turnstileResponse())
 }
 
+func TestLoginRequestTurnstileResponse(t *testing.T) {
+	req := loginRequest{
+		CFTurnstileResponse: " cf-token ",
+		TurnstileToken:      "legacy-token",
+	}
+	require.Equal(t, "cf-token", req.turnstileResponse())
+
+	req.CFTurnstileResponse = ""
+	require.Equal(t, "legacy-token", req.turnstileResponse())
+}
+
 func requireEnvelopeError(t *testing.T, err error, errorType string, code int) {
 	t.Helper()
 
