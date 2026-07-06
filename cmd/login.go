@@ -46,6 +46,7 @@ func handleLogin(r *fastglue.Request) error {
 		Email:     user.Email.String,
 		FirstName: user.FirstName,
 		LastName:  user.LastName,
+		Type:      user.Type,
 	}, r); err != nil {
 		app.lo.Error("error saving session", "error", err)
 		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
@@ -92,5 +93,10 @@ func handleLogout(r *fastglue.Request) error {
 		"no-store, no-cache, must-revalidate, post-check=0, pre-check=0")
 	r.RequestCtx.Response.Header.Add("Pragma", "no-cache")
 	r.RequestCtx.Response.Header.Add("Expires", "-1")
-	return r.RedirectURI("/", fasthttp.StatusFound, nil, "")
+	var csrfCookie fasthttp.Cookie
+	csrfCookie.SetKey("csrf_token")
+	csrfCookie.SetPath("/")
+	csrfCookie.SetExpire(fasthttp.CookieExpireDelete)
+	r.RequestCtx.Response.Header.SetCookie(&csrfCookie)
+	return r.SendEnvelope(true)
 }

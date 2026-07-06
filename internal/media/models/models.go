@@ -25,6 +25,7 @@ type Media struct {
 	Filename    string          `db:"filename" json:"filename"`
 	ContentType string          `db:"content_type" json:"content_type"`
 	ContentID   string          `db:"content_id" json:"content_id"`
+	OwnerUserID null.Int        `db:"owner_user_id" json:"owner_user_id"`
 	ModelID     null.Int        `db:"model_id" json:"model_id"`
 	Model       null.String     `db:"model_type" json:"model_type"`
 	Disposition null.String     `db:"disposition" json:"disposition"`

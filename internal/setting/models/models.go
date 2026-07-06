@@ -1,15 +1,17 @@
 package models
 
 type General struct {
-	SiteName                    string   `json:"app.site_name"`
-	Lang                        string   `json:"app.lang"`
-	MaxFileUploadSize           int      `json:"app.max_file_upload_size"`
-	FaviconURL                  string   `json:"app.favicon_url"`
-	LogoURL                     string   `json:"app.logo_url"`
-	RootURL                     string   `json:"app.root_url"`
-	AllowedFileUploadExtensions []string `json:"app.allowed_file_upload_extensions"`
-	Timezone                    string   `json:"app.timezone"`
-	BusinessHoursID             string   `json:"app.business_hours_id"`
+	SiteName                       string   `json:"app.site_name"`
+	Lang                           string   `json:"app.lang"`
+	MaxFileUploadSize              int      `json:"app.max_file_upload_size"`
+	FaviconURL                     string   `json:"app.favicon_url"`
+	LogoURL                        string   `json:"app.logo_url"`
+	RootURL                        string   `json:"app.root_url"`
+	AllowedFileUploadExtensions    []string `json:"app.allowed_file_upload_extensions"`
+	Timezone                       string   `json:"app.timezone"`
+	BusinessHoursID                string   `json:"app.business_hours_id"`
+	PublicTicketRequireLogin       bool     `json:"app.public_ticket_require_login"`
+	PublicTicketRequireOrderNumber bool     `json:"app.public_ticket_require_order_number"`
 }
 
 type EmailNotification struct {

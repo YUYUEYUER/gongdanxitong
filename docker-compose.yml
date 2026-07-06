@@ -1,7 +1,10 @@
 services:
   # Libredesk app
   app:
-    image: libredesk/libredesk:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: libredesk-local:latest
     container_name: libredesk_app
     restart: unless-stopped
     ports:

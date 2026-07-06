@@ -18,6 +18,12 @@
     @apply bg-background text-foreground;
   }
 
+  html.outer-route-scroll,
+  body.outer-route-scroll {
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
   ::selection {
     background: hsl(var(--foreground) / 0.15);
     color: hsl(var(--foreground));
@@ -89,7 +95,7 @@
     }
 
     // Mention styling — vue-letter scopes classes as msg_XXX_ld-mention
-    [class$="_ld-mention"],
+    [class$='_ld-mention'],
     .ld-mention {
       background-color: hsl(var(--primary) / 0.1);
       border-radius: 0.25rem;
@@ -303,16 +309,16 @@
   // siblings (no wrapping element), so we hide the marker AND everything
   // after it. Outlook always top-posts, so trailing siblings are quote.
   blockquote,
-  [id$="_divRplyFwdMsg"],
-  [id$="_divRplyFwdMsg"] ~ *,
-  [id$="_appendonsend"],
-  [id$="_appendonsend"] ~ *,
-  [id$="_OLK_SRC_BODY_SECTION"],
-  [id$="_OLK_SRC_BODY_SECTION"] ~ *,
-  [class*="_OutlookMessageHeader"],
-  [class*="_OutlookMessageHeader"] ~ *,
-  [class*="_yahoo_quoted"],
-  [class*="_gmail_quote_container"] {
+  [id$='_divRplyFwdMsg'],
+  [id$='_divRplyFwdMsg'] ~ *,
+  [id$='_appendonsend'],
+  [id$='_appendonsend'] ~ *,
+  [id$='_OLK_SRC_BODY_SECTION'],
+  [id$='_OLK_SRC_BODY_SECTION'] ~ *,
+  [class*='_OutlookMessageHeader'],
+  [class*='_OutlookMessageHeader'] ~ *,
+  [class*='_yahoo_quoted'],
+  [class*='_gmail_quote_container'] {
     @apply hidden;
   }
 }
@@ -359,6 +365,6 @@
  * but ml-[3.2rem] offset causes part to remain visible in the app's padding gap.
  * Push it further left to fully hide it.
  */
-[data-state="collapsed"][data-collapsible="offcanvas"] .sidebar-secondary {
+[data-state='collapsed'][data-collapsible='offcanvas'] .sidebar-secondary {
   left: calc((var(--sidebar-width) + 3.5rem) * -1.4) !important;
 }

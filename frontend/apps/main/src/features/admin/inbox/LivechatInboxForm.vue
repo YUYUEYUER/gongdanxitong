@@ -1130,8 +1130,8 @@ const form = useForm({
       website_url: '',
       dark_mode: false,
       show_powered_by: true,
-      language: 'en-US',
-      fallback_language: 'en-US',
+      language: 'zh-CN',
+      fallback_language: 'zh-CN',
       logo_url: '',
       launcher: {
         position: 'right',

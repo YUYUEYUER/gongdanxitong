@@ -44,6 +44,7 @@ SELECT
     u.api_key,
     u.api_key_last_used_at,
     u.external_user_id,
+    u.custom_attributes,
     u.api_secret,
     array_agg(DISTINCT r.name) FILTER (WHERE r.name IS NOT NULL) AS roles,
     COALESCE(
@@ -145,7 +146,7 @@ SELECT availability_status FROM users WHERE id = $1;
 -- name: set-reset-password-token
 UPDATE users
 SET reset_password_token = $2, reset_password_token_expiry = now() + interval '1 day'
-WHERE id = $1 AND type = 'agent';
+WHERE id = $1 AND type IN ('agent', 'contact');
 
 -- name: set-password
 UPDATE users

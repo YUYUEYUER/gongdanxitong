@@ -139,3 +139,31 @@ continuity_scan_interval = "5m"
 [sla]
 # How often to evaluate SLA compliance for conversations
 evaluation_interval = "5m"
+
+[turnstile]
+# Enable Cloudflare Turnstile for public-facing forms such as registration and password reset.
+enabled = false
+# Cloudflare Turnstile site key for client-side rendering.
+site_key = ""
+# Cloudflare Turnstile secret key for server-side verification.
+secret_key = ""
+# Cloudflare Siteverify API URL.
+verify_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+# Siteverify request timeout in milliseconds.
+verify_timeout_ms = 5000
+
+[register_rate_limit]
+# Registration rate limit window in seconds. Applies independently to IP, email, and display name.
+window_seconds = 300
+# Maximum registration attempts allowed in the rate limit window.
+max_attempts = 5
+
+[rate_limit.public_ticket_captcha]
+# Limit how often a single IP can refresh the public ticket CAPTCHA
+enabled = true
+requests_per_minute = 30
+
+[rate_limit.public_ticket_submit]
+# Limit how often a single IP can submit public ticket forms
+enabled = true
+requests_per_minute = 10

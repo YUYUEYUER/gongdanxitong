@@ -46,6 +46,7 @@ import (
 	"github.com/abhinavxd/libredesk/internal/tag"
 	"github.com/abhinavxd/libredesk/internal/team"
 	"github.com/abhinavxd/libredesk/internal/template"
+	"github.com/abhinavxd/libredesk/internal/turnstile"
 	"github.com/abhinavxd/libredesk/internal/user"
 	"github.com/abhinavxd/libredesk/internal/webhook"
 	"github.com/abhinavxd/libredesk/internal/ws"
@@ -79,12 +80,14 @@ type App struct {
 	fs               stuffbin.FileSystem
 	consts           atomic.Value
 	auth             *auth_.Auth
+	customerAuth     *auth_.Auth
 	authz            *authz.Enforcer
 	i18n             *i18n.I18n
 	lo               *logf.Logger
 	oidc             *oidc.Manager
 	media            *media.Manager
 	setting          *setting.Manager
+	turnstile        *turnstile.Verifier
 	role             *role.Manager
 	user             *user.Manager
 	team             *team.Manager
@@ -214,6 +217,8 @@ func main() {
 		status                      = initStatus(db, i18n)
 		priority                    = initPriority(db, i18n)
 		auth                        = initAuth(oidc, rdb, i18n)
+		customerAuth                = initCustomerAuth(rdb, i18n)
+		turnstileVerifier           = initTurnstile(lo)
 		template                    = initTemplate(db, fs, constants, i18n)
 		media                       = initMedia(db, i18n, settings)
 		inbox                       = initInbox(db, i18n)
@@ -259,6 +264,8 @@ func main() {
 		oidc:             oidc,
 		i18n:             i18n,
 		auth:             auth,
+		customerAuth:     customerAuth,
+		turnstile:        turnstileVerifier,
 		media:            media,
 		setting:          settings,
 		inbox:            inbox,

@@ -94,6 +94,7 @@ func handleOIDCCallback(r *fastglue.Request) error {
 		Email:     user.Email.String,
 		FirstName: user.FirstName,
 		LastName:  user.LastName,
+		Type:      user.Type,
 	}, r); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError,
 			app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)

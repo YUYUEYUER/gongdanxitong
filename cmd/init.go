@@ -48,6 +48,7 @@ import (
 	"github.com/abhinavxd/libredesk/internal/tag"
 	"github.com/abhinavxd/libredesk/internal/team"
 	tmpl "github.com/abhinavxd/libredesk/internal/template"
+	turnstilesvc "github.com/abhinavxd/libredesk/internal/turnstile"
 	"github.com/abhinavxd/libredesk/internal/user"
 	"github.com/abhinavxd/libredesk/internal/view"
 	"github.com/abhinavxd/libredesk/internal/webhook"
@@ -102,6 +103,7 @@ func initConfig(ko *koanf.Koanf) {
 			return key, val
 		},
 	}), nil)
+	ko.Load(confmap.Provider(envAliases(), "."), nil)
 }
 
 // validateConfig logs warnings/fatals for invalid config values.
@@ -116,6 +118,32 @@ func validateConfig(ko *koanf.Koanf) {
 	if encKey == sampleEncKey {
 		colorlog.Red("WARNING: You are using the sample encryption_key from config.sample.toml. Change it immediately. Generate a secure key with `openssl rand -hex 16`")
 	}
+
+	if ko.Bool("turnstile.enabled") {
+		if strings.TrimSpace(ko.String("turnstile.site_key")) == "" || strings.TrimSpace(ko.String("turnstile.secret_key")) == "" {
+			colorlog.Red("WARNING: turnstile.enabled is true but site_key or secret_key is missing. Turnstile protection will stay disabled.")
+		}
+	}
+}
+
+func envAliases() map[string]any {
+	aliases := map[string]string{
+		"TURNSTILE_ENABLED":                  "turnstile.enabled",
+		"TURNSTILE_SITE_KEY":                 "turnstile.site_key",
+		"TURNSTILE_SECRET_KEY":               "turnstile.secret_key",
+		"TURNSTILE_VERIFY_URL":               "turnstile.verify_url",
+		"TURNSTILE_VERIFY_TIMEOUT_MS":        "turnstile.verify_timeout_ms",
+		"REGISTER_RATE_LIMIT_WINDOW_SECONDS": "register_rate_limit.window_seconds",
+		"REGISTER_RATE_LIMIT_MAX_ATTEMPTS":   "register_rate_limit.max_attempts",
+	}
+
+	out := make(map[string]any, len(aliases))
+	for envKey, configKey := range aliases {
+		if value := strings.TrimSpace(os.Getenv(envKey)); value != "" {
+			out[configKey] = value
+		}
+	}
+	return out
 }
 
 // initFlags initializes the commandline flags.
@@ -264,6 +292,22 @@ func initSettings(db *sqlx.DB) *setting.Manager {
 		log.Fatalf("error initializing setting manager: %v", err)
 	}
 	return s
+}
+
+func initTurnstile(lo *logf.Logger) *turnstilesvc.Verifier {
+	enabled := ko.Bool("turnstile.enabled")
+	if !enabled {
+		enabled = strings.TrimSpace(os.Getenv("TURNSTILE_SITE_KEY")) != "" &&
+			strings.TrimSpace(os.Getenv("TURNSTILE_SECRET_KEY")) != ""
+	}
+	return turnstilesvc.New(
+		enabled,
+		ko.String("turnstile.site_key"),
+		ko.String("turnstile.secret_key"),
+		lo,
+		turnstilesvc.WithVerifyURL(turnstileVerifyURL()),
+		turnstilesvc.WithTimeout(turnstileVerifyTimeout()),
+	)
 }
 
 // initUser inits user manager.
@@ -794,11 +838,32 @@ func initAuth(o *oidc.Manager, rd *redis.Client, i18n *i18n.I18n) *auth_.Auth {
 
 	secure := !ko.Bool("app.server.disable_secure_cookies")
 	sessionLifetime := ko.Duration("app.server.session_lifetime")
-	auth, err := auth_.New(auth_.Config{Providers: providers, SecureCookies: secure, SessionLifetime: sessionLifetime}, i18n, rd, lo)
+	auth, err := auth_.New(auth_.Config{
+		Providers:       providers,
+		SecureCookies:   secure,
+		SessionLifetime: sessionLifetime,
+		CookieName:      "libredesk_session",
+	}, i18n, rd, lo)
 	if err != nil {
 		log.Fatalf("error initializing auth: %v", err)
 	}
 
+	return auth
+}
+
+// initCustomerAuth initializes the customer portal authentication manager with an isolated cookie.
+func initCustomerAuth(rd *redis.Client, i18n *i18n.I18n) *auth_.Auth {
+	lo := initLogger("customer-auth")
+	secure := !ko.Bool("app.server.disable_secure_cookies")
+	sessionLifetime := ko.Duration("app.server.session_lifetime")
+	auth, err := auth_.New(auth_.Config{
+		SecureCookies:   secure,
+		SessionLifetime: sessionLifetime,
+		CookieName:      "libredesk_customer_session",
+	}, i18n, rd, lo)
+	if err != nil {
+		log.Fatalf("error initializing customer auth: %v", err)
+	}
 	return auth
 }
 
@@ -859,13 +924,9 @@ func initOIDC(db *sqlx.DB, settings *setting.Manager, i18n *i18n.I18n) *oidc.Man
 func initI18n(fs stuffbin.FileSystem) *i18n.I18n {
 	fileName := cmp.Or(ko.String("app.lang"), defLang)
 	log.Printf("loading i18n language file: %s", fileName)
-	file, err := fs.Get("i18n/" + fileName + ".json")
+	i18n, err := loadI18nLang(fileName, fs)
 	if err != nil {
-		log.Fatalf("error reading i18n language file `%s` : %v", fileName, err)
-	}
-	i18n, err := i18n.New(file.ReadBytes())
-	if err != nil {
-		log.Fatalf("error initializing i18n: %v", err)
+		log.Fatalf("error initializing i18n language file `%s`: %v", fileName, err)
 	}
 	return i18n
 }
@@ -1143,6 +1204,8 @@ func initRateLimit(redisClient *redis.Client) *ratelimit.Limiter {
 		{"widget", 100},
 		{"auth", 30},
 		{"public", 100},
+		{"public_ticket_captcha", 30},
+		{"public_ticket_submit", 10},
 	}
 
 	for _, d := range defaults {

@@ -6,6 +6,7 @@ libredesk
 libredesk.exe
 uploads
 .env
+.tmp-*
 dist/
 .vscode/
 static/widget.min.js

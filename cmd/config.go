@@ -26,10 +26,15 @@ func handleGetConfig(r *fastglue.Request) error {
 
 	// Filter to only include public fields needed for initial app load
 	publicSettings := map[string]any{
-		"app.lang":        settings["app.lang"],
-		"app.favicon_url": settings["app.favicon_url"],
-		"app.logo_url":    settings["app.logo_url"],
-		"app.site_name":   settings["app.site_name"],
+		"app.lang":               settings["app.lang"],
+		"app.favicon_url":        settings["app.favicon_url"],
+		"app.logo_url":           settings["app.logo_url"],
+		"app.site_name":          settings["app.site_name"],
+		"app.turnstile_enabled":  app.turnstile != nil && app.turnstile.Enabled(),
+		"app.turnstile_site_key": "",
+	}
+	if app.turnstile != nil {
+		publicSettings["app.turnstile_site_key"] = app.turnstile.SiteKey()
 	}
 
 	// Get all OIDC providers

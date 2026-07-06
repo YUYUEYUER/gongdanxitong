@@ -239,6 +239,26 @@ WHERE c.contact_id = $1
 ORDER BY c.created_at DESC
 LIMIT $2;
 
+-- name: get-customer-conversations
+SELECT
+    COUNT(*) OVER() AS total,
+    c.uuid,
+    c.reference_number,
+    c.subject,
+    cs.name AS status,
+    inb.name AS inbox_name,
+    c.created_at,
+    c.updated_at,
+    c.last_reply_at,
+    c.last_message_at,
+    c.last_message
+FROM conversations c
+JOIN inboxes inb ON inb.id = c.inbox_id
+LEFT JOIN conversation_statuses cs ON cs.id = c.status_id
+WHERE c.contact_id = $1
+ORDER BY c.updated_at DESC
+LIMIT $2 OFFSET $3;
+
 -- name: get-chat-conversation
 SELECT
     c.created_at,

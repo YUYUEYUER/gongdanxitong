@@ -10,6 +10,7 @@ import { useEmitter } from './composables/useEmitter'
 import { toast as sooner } from 'vue-sonner'
 
 const emitter = useEmitter()
+const OUTER_ROUTE_SCROLL_CLASS = 'outer-route-scroll'
 
 const toastHandler = (message) => {
   if (!message.description) return
@@ -21,10 +22,14 @@ const toastHandler = (message) => {
 }
 
 onMounted(() => {
+  document.documentElement.classList.add(OUTER_ROUTE_SCROLL_CLASS)
+  document.body.classList.add(OUTER_ROUTE_SCROLL_CLASS)
   emitter.on(EMITTER_EVENTS.SHOW_TOAST, toastHandler)
 })
 
 onUnmounted(() => {
+  document.documentElement.classList.remove(OUTER_ROUTE_SCROLL_CLASS)
+  document.body.classList.remove(OUTER_ROUTE_SCROLL_CLASS)
   emitter.off(EMITTER_EVENTS.SHOW_TOAST, toastHandler)
 })
 </script>

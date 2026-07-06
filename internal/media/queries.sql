@@ -1,5 +1,5 @@
 -- name: insert-media
-INSERT INTO media (store, filename, content_type, size, meta, model_id, model_type, disposition, content_id, uuid)
+INSERT INTO media (store, filename, content_type, size, meta, model_id, model_type, disposition, content_id, uuid, owner_user_id)
 VALUES(
   $1, 
   $2, 
@@ -10,12 +10,13 @@ VALUES(
   NULLIF($7, ''),
   $8,
   $9,
-  $10
+  $10,
+  NULLIF($11, 0)
 )
 RETURNING id;
 
 -- name: get-media
-SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, model_id, model_type, disposition, "size", meta
+SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, owner_user_id, model_id, model_type, disposition, "size", meta
 FROM media
 WHERE
    ($1 > 0 AND id = $1)
@@ -23,7 +24,7 @@ WHERE
    ($2 != '' AND uuid = NULLIF($2, '')::uuid)
 
 -- name: get-media-by-uuid
-SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, model_id, model_type, disposition, "size", meta
+SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, owner_user_id, model_id, model_type, disposition, "size", meta
 FROM media
 WHERE uuid = $1;
 
@@ -38,13 +39,13 @@ SET model_type = $2,
 WHERE id = $1;
 
 -- name: get-model-media
-SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, model_id, model_type, disposition, "size", meta
+SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, owner_user_id, model_id, model_type, disposition, "size", meta
 FROM media
 WHERE model_type = $1
     AND model_id = $2;
 
 -- name: get-unlinked-message-media
-SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, model_id, model_type, disposition, "size", meta
+SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, owner_user_id, model_id, model_type, disposition, "size", meta
 FROM media
 WHERE model_type = 'messages' 
   AND (model_id IS NULL OR model_id = 0) 
@@ -59,7 +60,7 @@ WHERE m.model_type = 'messages'
   AND cm.conversation_id = (SELECT id FROM conversations WHERE uuid = $2::uuid LIMIT 1);
 
 -- name: get-media-by-content-ids
-SELECT m.id, m.created_at, m.updated_at, m."uuid", m.store, m.filename, m.content_type, m.content_id, m.model_id, m.model_type, m.disposition, m."size", m.meta
+SELECT m.id, m.created_at, m.updated_at, m."uuid", m.store, m.filename, m.content_type, m.content_id, m.owner_user_id, m.model_id, m.model_type, m.disposition, m."size", m.meta
 FROM media m
 INNER JOIN conversation_messages cm ON cm.id = m.model_id
 WHERE m.model_type = 'messages'

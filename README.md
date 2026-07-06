@@ -89,6 +89,21 @@ __________________
 
 The backend is written in Go and the frontend is Vue.js 3 with Shadcn UI.
 
+### Turnstile and Registration Security
+
+Customer registration can be protected with Cloudflare Turnstile, CSRF validation, and registration-specific rate limits.
+
+```env
+TURNSTILE_SITE_KEY=your_site_key
+TURNSTILE_SECRET_KEY=your_secret_key
+TURNSTILE_VERIFY_URL=https://challenges.cloudflare.com/turnstile/v0/siteverify
+TURNSTILE_VERIFY_TIMEOUT_MS=5000
+REGISTER_RATE_LIMIT_WINDOW_SECONDS=300
+REGISTER_RATE_LIMIT_MAX_ATTEMPTS=5
+```
+
+`TURNSTILE_SITE_KEY` is exposed through the public app config so the Vue registration page can render the widget. `TURNSTILE_SECRET_KEY` is only read by the Go backend and must never be committed or sent to the frontend. `.env` is ignored by Git; use `.env.example` as the local template.
+
 
 
 ## Translators

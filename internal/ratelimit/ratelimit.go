@@ -1,8 +1,10 @@
 package ratelimit
 
 import (
+	"context"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	realip "github.com/ferluci/fast-realip"
@@ -21,6 +23,15 @@ type Rule struct {
 type Limiter struct {
 	redis *redis.Client
 	rules map[string]Rule
+}
+
+var windowMemberSeq atomic.Uint64
+
+type WindowResult struct {
+	Allowed    bool
+	Limit      int
+	Remaining  int
+	RetryAfter time.Duration
 }
 
 // New creates a new rate limiter.
@@ -79,4 +90,39 @@ func (l *Limiter) Check(ctx *fasthttp.RequestCtx, ruleName string) error {
 	remaining := max(int(limit-count), 0)
 	ctx.Response.Header.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 	return nil
+}
+
+// CheckWindow applies a fixed custom window limit for a fully-qualified key.
+func (l *Limiter) CheckWindow(ctx context.Context, key string, window time.Duration, maxAttempts int) (WindowResult, error) {
+	result := WindowResult{
+		Allowed:   true,
+		Limit:     maxAttempts,
+		Remaining: max(maxAttempts-1, 0),
+	}
+	if l == nil || l.redis == nil || key == "" || window <= 0 || maxAttempts <= 0 {
+		return result, nil
+	}
+
+	now := time.Now()
+	nowMilli := now.UnixMilli()
+	windowStart := strconv.FormatInt(now.Add(-window).UnixMilli(), 10)
+
+	pipe := l.redis.Pipeline()
+	pipe.ZRemRangeByScore(ctx, key, "-inf", windowStart)
+	pipe.ZAdd(ctx, key, redis.Z{Score: float64(nowMilli), Member: fmt.Sprintf("%d:%d", now.UnixNano(), windowMemberSeq.Add(1))})
+	countCmd := pipe.ZCard(ctx, key)
+	pipe.Expire(ctx, key, window+time.Minute)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return result, err
+	}
+
+	count := int(countCmd.Val())
+	result.Remaining = max(maxAttempts-count, 0)
+	if count > maxAttempts {
+		result.Allowed = false
+		result.Remaining = 0
+		result.RetryAfter = window
+	}
+
+	return result, nil
 }

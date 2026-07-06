@@ -96,6 +96,20 @@ type ChatConversation struct {
 	Assignee           *umodels.ChatUser `db:"assignee" json:"assignee"`
 }
 
+type CustomerConversation struct {
+	Total           int         `db:"total" json:"-"`
+	UUID            string      `db:"uuid" json:"uuid"`
+	ReferenceNumber string      `db:"reference_number" json:"reference_number"`
+	Subject         null.String `db:"subject" json:"subject"`
+	Status          null.String `db:"status" json:"status"`
+	InboxName       string      `db:"inbox_name" json:"inbox_name"`
+	CreatedAt       time.Time   `db:"created_at" json:"created_at"`
+	UpdatedAt       time.Time   `db:"updated_at" json:"updated_at"`
+	LastReplyAt     null.Time   `db:"last_reply_at" json:"last_reply_at"`
+	LastMessageAt   null.Time   `db:"last_message_at" json:"last_message_at"`
+	LastMessage     null.String `db:"last_message" json:"last_message"`
+}
+
 type ChatMessage struct {
 	UUID             string                 `json:"uuid"`
 	Status           string                 `json:"status"`

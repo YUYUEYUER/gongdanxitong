@@ -145,7 +145,7 @@ type mediaStore interface {
 	GetByContentIDs(contentIDs []string, conversationUUID string) ([]mmodels.Media, error)
 	ContentIDExists(contentID, conversationUUID string) (bool, string, error)
 	Upload(fileName, contentType string, content io.ReadSeeker) (string, string, error)
-	UploadAndInsert(fileName, contentType, contentID string, modelType null.String, modelID null.Int, content io.ReadSeeker, fileSize int, disposition null.String, meta []byte) (mmodels.Media, error)
+	UploadAndInsert(fileName, contentType, contentID string, modelType null.String, modelID, ownerUserID null.Int, content io.ReadSeeker, fileSize int, disposition null.String, meta []byte) (mmodels.Media, error)
 }
 
 type inboxStore interface {
@@ -267,6 +267,7 @@ type queries struct {
 	GetContactChatConversations        *sqlx.Stmt `query:"get-contact-chat-conversations"`
 	GetChatConversation                *sqlx.Stmt `query:"get-chat-conversation"`
 	GetContactPreviousConversations    *sqlx.Stmt `query:"get-contact-previous-conversations"`
+	GetCustomerConversations           *sqlx.Stmt `query:"get-customer-conversations"`
 	GetConversationParticipants        *sqlx.Stmt `query:"get-conversation-participants"`
 	GetUserActiveConversationsCount    *sqlx.Stmt `query:"get-user-active-conversations-count"`
 	UpdateConversationWaitingSince     *sqlx.Stmt `query:"update-conversation-waiting-since"`
@@ -408,6 +409,30 @@ func (c *Manager) GetContactPreviousConversations(contactID int, limit int) ([]m
 		return conversations, envelope.NewError(envelope.GeneralError, c.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	return conversations, nil
+}
+
+// GetCustomerConversations retrieves paginated conversations for a customer contact.
+func (c *Manager) GetCustomerConversations(contactID, page, pageSize int) ([]models.CustomerConversation, int, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+
+	var conversations = make([]models.CustomerConversation, 0)
+	if err := c.q.GetCustomerConversations.Select(&conversations, contactID, pageSize, offset); err != nil {
+		c.lo.Error("error fetching customer conversations", "contact_id", contactID, "error", err)
+		return conversations, 0, envelope.NewError(envelope.GeneralError, c.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	total := 0
+	if len(conversations) > 0 {
+		total = conversations[0].Total
+	}
+
+	return conversations, total, nil
 }
 
 // GetContactChatConversations retrieves chat conversations for a contact in a specific inbox.

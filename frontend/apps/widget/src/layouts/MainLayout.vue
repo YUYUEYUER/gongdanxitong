@@ -27,14 +27,9 @@
         v-if="widgetStore.config?.show_powered_by !== false && widgetStore.isChatView"
         class="flex items-center justify-center pb-1.5"
       >
-        <a
-          href="https://libredesk.io"
-          target="_blank"
-          rel="noopener noreferrer"
-          class="text-[10px] text-muted-foreground/70 hover:text-muted-foreground transition-colors no-underline"
-        >
-          Powered by <span class="font-medium">libredesk</span>
-        </a>
+        <div class="text-[10px] text-muted-foreground/70">
+          Powered by <span class="font-medium">lya</span>
+        </div>
       </div>
 
       <!-- Network Connection Banner -->

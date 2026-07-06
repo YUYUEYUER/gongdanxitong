@@ -20,7 +20,7 @@ const maxPageSize = 500
 func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	// Authentication.
 	g.POST("/api/v1/auth/login", rateLimit(handleLogin, "auth"))
-	g.GET("/logout", auth(handleLogout))
+	g.POST("/api/v1/auth/logout", auth(handleLogout))
 	g.GET("/api/v1/oidc/{id}/login", rateLimit(handleOIDCLogin, "auth"))
 	g.GET("/api/v1/oidc/{id}/finish", rateLimit(handleOIDCCallback, "auth"))
 
@@ -30,6 +30,25 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 
 	// Public config for app initialization.
 	g.GET("/api/v1/config", handleGetConfig)
+	g.GET("/api/v1/public/tickets/config", rateLimit(handleGetPublicTicketConfig, "public"))
+	g.GET("/api/v1/public/tickets/captcha", rateLimit(handleGetPublicTicketCaptcha, "public_ticket_captcha"))
+	g.POST("/api/v1/public/tickets", rateLimit(tryCustomerAuth(handleCreatePublicTicket), "public_ticket_submit"))
+
+	// Customer portal auth.
+	g.POST("/api/v1/customer/auth/register", rateLimit(handleCustomerRegister, "auth"))
+	g.POST("/api/v1/customer/auth/login", rateLimit(handleCustomerLogin, "auth"))
+	g.POST("/api/v1/customer/auth/forgot-password", rateLimit(handleCustomerForgotPassword, "auth"))
+	g.POST("/api/v1/customer/auth/reset-password", rateLimit(handleCustomerResetPassword, "auth"))
+	g.GET("/api/v1/customer/auth/me", customerAuth(handleGetCurrentCustomer))
+	g.POST("/api/v1/customer/auth/logout", customerAuth(handleCustomerLogout))
+
+	// Customer portal tickets.
+	g.POST("/api/v1/customer/media", customerAuth(handleMediaUpload))
+	g.GET("/api/v1/customer/tickets/config", customerAuth(handleCustomerTicketConfig))
+	g.GET("/api/v1/customer/tickets", customerAuth(handleCustomerListTickets))
+	g.POST("/api/v1/customer/tickets", customerAuth(handleCustomerCreateTicket))
+	g.GET("/api/v1/customer/tickets/{uuid}", customerAuth(handleCustomerGetTicket))
+	g.POST("/api/v1/customer/tickets/{uuid}/messages", customerAuth(handleCustomerReplyTicket))
 
 	// Media - supports both authenticated access and signed URLs.
 	g.GET("/uploads/{uuid}", authOrSignedURL(handleServeMedia))
@@ -285,6 +304,15 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 
 	// Frontend pages.
 	g.GET("/", notAuthPage(serveIndexPage))
+	g.GET("/submit-ticket", publicTicketPage(serveIndexPage))
+	g.GET("/portal/login", customerNotAuthPage(serveIndexPage))
+	g.GET("/portal/register", customerNotAuthPage(serveIndexPage))
+	g.GET("/portal/forgot-password", customerNotAuthPage(serveIndexPage))
+	g.GET("/portal/reset-password", customerNotAuthPage(serveIndexPage))
+	g.GET("/portal/tickets", customerAuthPage(serveIndexPage))
+	g.GET("/portal/tickets/new", customerAuthPage(serveIndexPage))
+	g.GET("/portal/tickets/{all:*}", customerAuthPage(serveIndexPage))
+	g.GET("/portal", serveIndexPage)
 	g.GET("/widget", validateWidgetInbox(serveWidgetIndexPage))
 	g.GET("/inboxes/{all:*}", authPage(serveIndexPage))
 	g.GET("/teams/{all:*}", authPage(serveIndexPage))

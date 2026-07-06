@@ -43,6 +43,12 @@ onMounted(async () => {
     acc[newKey] = data[key]
     return acc
   }, {})
+  if (typeof initialValues.value.public_ticket_require_login !== 'boolean') {
+    initialValues.value.public_ticket_require_login = true
+  }
+  if (typeof initialValues.value.public_ticket_require_order_number !== 'boolean') {
+    initialValues.value.public_ticket_require_order_number = false
+  }
 })
 
 const submitForm = async (values) => {

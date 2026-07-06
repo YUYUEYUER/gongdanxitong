@@ -126,7 +126,7 @@
             {{ else if ne SiteName "" }}
                 <span style="font-size: 18px; font-weight: 700; color: #09090b;">{{ SiteName }}</span>
             {{ else }}
-                <span style="font-size: 18px; font-weight: 700; color: #09090b;">libredesk</span>
+                <span style="font-size: 18px; font-weight: 700; color: #09090b;">lya</span>
             {{ end }}
         </div>
 {{ end }}
@@ -134,7 +134,7 @@
 {{ define "footer" }}
     </div>
     <div class="footer">
-        <span>Powered by <a href="https://libredesk.io/" target="_blank">libredesk</a></span>
+        <span>Powered by {{ if ne SiteName "" }}{{ SiteName }}{{ else }}lya{{ end }}</span>
     </div>
     <div class="gutter">&nbsp;</div>
 </body>

@@ -24,9 +24,14 @@ import (
 // handleMediaUpload handles media uploads.
 func handleMediaUpload(r *fastglue.Request) error {
 	var (
-		app     = r.Context.(*App)
-		cleanUp = false
+		app         = r.Context.(*App)
+		cleanUp     = false
+		ownerUserID null.Int
 	)
+
+	if user, ok := r.RequestCtx.UserValue("user").(amodels.User); ok && user.ID > 0 {
+		ownerUserID = null.IntFrom(user.ID)
+	}
 
 	form, err := r.RequestCtx.MultipartForm()
 	if err != nil {
@@ -139,7 +144,18 @@ func handleMediaUpload(r *fastglue.Request) error {
 	}
 
 	// Insert in DB.
-	media, err := app.media.Insert(disposition, srcFileName, srcContentType, "" /**content_id**/, null.NewString(linkedModel, linkedModel != ""), uuid.String(), null.Int{} /**model_id**/, int(srcFileSize), meta)
+	media, err := app.media.Insert(
+		disposition,
+		srcFileName,
+		srcContentType,
+		"", /**content_id**/
+		null.NewString(linkedModel, linkedModel != ""),
+		uuid.String(),
+		null.Int{}, /**model_id**/
+		ownerUserID,
+		int(srcFileSize),
+		meta,
+	)
 	if err != nil {
 		cleanUp = true
 		app.lo.Error("error inserting metadata into database", "error", err)
@@ -251,7 +267,8 @@ func bytesToMegabytes(bytes int64) float64 {
 }
 
 // getUnassociatedMedia fetches media by IDs, skipping any already associated with a model.
-func getUnassociatedMedia(app *App, ids []int) ([]mmodels.Media, error) {
+// Unattached uploads are scoped to the uploading user to prevent cross-account attachment reuse.
+func getUnassociatedMedia(app *App, ids []int, ownerUserID int) ([]mmodels.Media, error) {
 	all, err := app.media.GetMany(ids)
 	if err != nil {
 		return nil, err
@@ -261,6 +278,10 @@ func getUnassociatedMedia(app *App, ids []int) ([]mmodels.Media, error) {
 		if m.ModelID.Int > 0 {
 			app.lo.Warn("attachment already associated with another model, skipping", "media_id", m.ID, "model", m.Model.String, "model_id", m.ModelID.Int)
 			continue
+		}
+		if ownerUserID > 0 && (!m.OwnerUserID.Valid || m.OwnerUserID.Int != ownerUserID) {
+			app.lo.Warn("attachment owner mismatch", "media_id", m.ID, "expected_owner_user_id", ownerUserID, "owner_user_id", m.OwnerUserID.Int)
+			return nil, envelope.NewError(envelope.PermissionError, app.i18n.T("status.deniedPermission"), nil)
 		}
 		out = append(out, m)
 	}

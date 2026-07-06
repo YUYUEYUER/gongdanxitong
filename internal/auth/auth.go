@@ -50,10 +50,12 @@ type Config struct {
 	Providers       []Provider
 	SecureCookies   bool
 	SessionLifetime time.Duration
+	CookieName      string
 }
 
 // defaultSessionLifetime is used when Config.SessionLifetime is unset or non-positive.
 const defaultSessionLifetime = 9 * time.Hour
+const defaultCookieName = "libredesk_session"
 
 // Auth is the auth service it manages OIDC authentication and sessions
 type Auth struct {
@@ -98,11 +100,16 @@ func New(cfg Config, i18n *i18n.I18n, rd *redis.Client, logger *logf.Logger) (*A
 		lifetime = defaultSessionLifetime
 	}
 
+	cookieName := cfg.CookieName
+	if cookieName == "" {
+		cookieName = defaultCookieName
+	}
+
 	sess := simplesessions.New(simplesessions.Options{
 		EnableAutoCreate: true,
 		SessionIDLength:  64,
 		Cookie: simplesessions.CookieOptions{
-			Name:       "libredesk_session",
+			Name:       cookieName,
 			IsHTTPOnly: true,
 			IsSecure:   cfg.SecureCookies,
 			SameSite:   http.SameSiteLaxMode,
@@ -165,7 +172,9 @@ func (a *Auth) Reload(cfg Config) error {
 		verifiers[provider.ID] = verifier
 	}
 
-	a.cfg = cfg
+	reloadedCfg := a.cfg
+	reloadedCfg.Providers = append([]Provider(nil), cfg.Providers...)
+	a.cfg = reloadedCfg
 	a.oauthCfgs = oauthCfgs
 	a.verifiers = verifiers
 
@@ -238,6 +247,7 @@ func (a *Auth) SaveSession(user amodels.User, r *fastglue.Request) error {
 		"email":      user.Email,
 		"first_name": user.FirstName,
 		"last_name":  user.LastName,
+		"type":       user.Type,
 	}); err != nil {
 		a.logger.Error("error setting login session", "error", err)
 		return err
@@ -299,6 +309,7 @@ func (a *Auth) SetCSRFCookie(r *fastglue.Request) error {
 		csrfCookie.SetPath("/")
 		csrfCookie.SetSecure(a.cfg.SecureCookies)
 		csrfCookie.SetHTTPOnly(false)
+		csrfCookie.SetSameSite(fasthttp.CookieSameSiteLaxMode)
 		r.RequestCtx.Response.Header.SetCookie(&csrfCookie)
 		return nil
 	}
@@ -316,7 +327,7 @@ func (a *Auth) ValidateSession(r *fastglue.Request) (models.User, error) {
 		return models.User{}, err
 	}
 
-	sessVals, err := sess.GetMulti("id", "email", "first_name", "last_name")
+	sessVals, err := sess.GetMulti("id", "email", "first_name", "last_name", "type")
 	if err != nil {
 		a.logger.Error("error fetching session variables", "error", err)
 		return models.User{}, err
@@ -327,6 +338,7 @@ func (a *Auth) ValidateSession(r *fastglue.Request) (models.User, error) {
 		email, _     = sess.String(sessVals["email"], nil)
 		firstName, _ = sess.String(sessVals["first_name"], nil)
 		lastName, _  = sess.String(sessVals["last_name"], nil)
+		userType, _  = sess.String(sessVals["type"], nil)
 	)
 
 	return models.User{
@@ -334,6 +346,7 @@ func (a *Auth) ValidateSession(r *fastglue.Request) (models.User, error) {
 		Email:     null.NewString(email, email != ""),
 		FirstName: firstName,
 		LastName:  lastName,
+		Type:      userType,
 	}, nil
 }
 

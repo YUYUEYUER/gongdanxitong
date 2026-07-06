@@ -1114,6 +1114,7 @@ func (m *Manager) uploadMessageAttachments(message *models.Message) error {
 			/** Linking media to message happens later **/
 			null.String{}, /** modelType */
 			null.Int{},    /** modelID **/
+			null.Int{},    /** ownerUserID **/
 			attachReader,
 			attachment.Size,
 			null.StringFrom(attachment.Disposition),

@@ -508,7 +508,7 @@ func uploadUserAvatar(r *fastglue.Request, user models.User, files []*multipart.
 	disposition := null.NewString("", false)
 	contentID := ""
 	meta := []byte("{}")
-	media, err := app.media.UploadAndInsert(srcFileName, srcContentType, contentID, linkedModel, linkedID, file, int(srcFileSize), disposition, meta)
+	media, err := app.media.UploadAndInsert(srcFileName, srcContentType, contentID, linkedModel, linkedID, null.IntFrom(user.ID), file, int(srcFileSize), disposition, meta)
 	if err != nil {
 		app.lo.Error("error uploading file", "user_id", user.ID, "error", err)
 		return envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.errorUploadingFile"), nil)

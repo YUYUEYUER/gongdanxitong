@@ -30,6 +30,76 @@ const routes = [
         name: 'set-password',
         component: () => import('@main/views/auth/SetPasswordView.vue'),
         meta: { titleKey: 'auth.setNewPassword' }
+      },
+      {
+        path: 'portal/login',
+        name: 'customer-login',
+        component: () => import('@main/views/customer/CustomerLoginView.vue'),
+        meta: { titleKey: 'auth.signInButton' }
+      },
+      {
+        path: 'portal/register',
+        name: 'customer-register',
+        component: () => import('@main/views/customer/CustomerRegisterView.vue'),
+        meta: { titleKey: 'auth.signInButton' }
+      },
+      {
+        path: 'portal/forgot-password',
+        name: 'customer-forgot-password',
+        component: () => import('@main/views/customer/CustomerForgotPasswordView.vue'),
+        meta: { titleKey: 'auth.resetPassword' }
+      },
+      {
+        path: 'portal/reset-password',
+        name: 'customer-reset-password',
+        component: () => import('@main/views/customer/CustomerResetPasswordView.vue'),
+        meta: { titleKey: 'auth.setNewPassword' }
+      },
+      {
+        path: 'portal',
+        component: () => import('@main/layouts/customer/CustomerPortalLayout.vue'),
+        children: [
+          {
+            path: '',
+            redirect: '/portal/tickets'
+          },
+          {
+            path: 'tickets',
+            name: 'customer-tickets',
+            component: () => import('@main/views/customer/CustomerTicketListView.vue'),
+            meta: {
+              titleKey: 'publicTicket.referenceNumber',
+              customerTitle: '我的工单',
+              customerDescription: '查看历史工单、提交新工单并继续回复。'
+            }
+          },
+          {
+            path: 'tickets/new',
+            name: 'customer-ticket-new',
+            component: () => import('@main/views/customer/CustomerTicketCreateView.vue'),
+            meta: {
+              titleKey: 'publicTicket.title',
+              customerTitle: '新建工单',
+              customerDescription: '登录后提交的工单会直接在系统内跟进。'
+            }
+          },
+          {
+            path: 'tickets/:uuid',
+            name: 'customer-ticket-detail',
+            component: () => import('@main/views/customer/CustomerTicketDetailView.vue'),
+            meta: {
+              titleKey: 'publicTicket.referenceNumber',
+              customerTitle: '工单详情',
+              customerDescription: '查看工单进度，并继续追加回复。'
+            }
+          }
+        ]
+      },
+      {
+        path: 'submit-ticket',
+        name: 'public-submit-ticket',
+        component: () => import('@main/views/public/PublicTicketView.vue'),
+        meta: { titleKey: 'publicTicket.pageTitle' }
       }
     ]
   },
@@ -585,13 +655,11 @@ router.beforeEach((to, from, next) => {
   }
 
   const appSettingsStore = useAppSettingsStore()
-  const siteName = appSettingsStore.settings?.['app.site_name'] || 'libredesk'
+  const siteName = appSettingsStore.settings?.['app.site_name'] || 'lya'
   const i18n = getI18n()
   const typeKey = typeof to.meta?.typeKey === 'function' ? to.meta.typeKey(to) : ''
   const titleKey = typeKey || to.meta?.titleKey
-  const pageTitle = titleKey && i18n
-    ? i18n.global.t(titleKey, to.meta?.titleCount || 1)
-    : ''
+  const pageTitle = titleKey && i18n ? i18n.global.t(titleKey, to.meta?.titleCount || 1) : ''
   document.title = `${pageTitle} - ${siteName}`
   next()
 })

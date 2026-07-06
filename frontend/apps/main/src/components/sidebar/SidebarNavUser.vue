@@ -119,16 +119,16 @@ import StatusDot from '@shared-ui/components/StatusDot.vue'
 import { Switch } from '@shared-ui/components/ui/switch'
 import { ChevronsUpDown, CircleUserRound, LogOut } from 'lucide-vue-next'
 import { useUserStore } from '../../stores/user'
-import { useRouter } from 'vue-router'
+import api from '../../api'
 
 import { useColorMode } from '@vueuse/core'
 
 const mode = useColorMode()
 const userStore = useUserStore()
-const router = useRouter()
 const { t } = useI18n()
 
-const logout = () => {
-  window.location.href = '/logout'
+const logout = async () => {
+  await api.logout()
+  window.location.assign('/')
 }
 </script>

@@ -388,6 +388,7 @@ CREATE TABLE media (
 	filename TEXT NOT NULL,
 	content_type TEXT NOT NULL,
 	content_id TEXT NULL,
+	owner_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
 	model_id INT NULL,
 	model_type TEXT NULL,
 	disposition media_disposition NULL,
@@ -398,6 +399,7 @@ CREATE TABLE media (
 );
 CREATE INDEX index_media_on_model_type_and_model_id ON media(model_type, model_id);
 CREATE INDEX index_media_on_content_id ON media(content_id);
+CREATE INDEX index_media_on_owner_user_id ON media(owner_user_id);
 
 DROP TABLE IF EXISTS oidc CASCADE;
 CREATE TABLE oidc (
@@ -714,15 +716,17 @@ VALUES
 -- Default settings
 INSERT INTO settings ("key", value)
 VALUES
-    ('app.lang', '"en-US"'::jsonb),
+    ('app.lang', '"zh-CN"'::jsonb),
     ('app.root_url', '"http://localhost:9000"'::jsonb),
     ('app.logo_url', '"http://localhost:9000/logo.png"'::jsonb),
     ('app.site_name', '"libredesk"'::jsonb),
     ('app.favicon_url', '"http://localhost:9000/favicon.ico"'::jsonb),
-    ('app.max_file_upload_size', '20'::jsonb),
-    ('app.allowed_file_upload_extensions', '["*"]'::jsonb),
+	('app.max_file_upload_size', '20'::jsonb),
+	('app.allowed_file_upload_extensions', '["*"]'::jsonb),
 	('app.timezone', '"Asia/Kolkata"'::jsonb),
 	('app.business_hours_id', '""'::jsonb),
+	('app.public_ticket_require_login', 'true'::jsonb),
+	('app.public_ticket_require_order_number', 'false'::jsonb),
     ('notification.email.username', '"admin@yourcompany.com"'::jsonb),
     ('notification.email.host', '""'::jsonb),
     ('notification.email.port', '587'::jsonb),

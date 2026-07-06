@@ -10,7 +10,7 @@ describe('Login Component', () => {
                     "app.favicon_url": "http://localhost:9000/favicon.ico",
                     "app.lang": "en",
                     "app.logo_url": "http://localhost:9000/logo.png",
-                    "app.site_name": "libredesk",
+                    "app.site_name": "lya",
                     "app.sso_providers": [
                         {
                             "client_id": "xx",
@@ -32,7 +32,7 @@ describe('Login Component', () => {
     })
 
     it('should display login form', () => {
-        cy.contains('h3', 'libredesk').should('be.visible')
+        cy.contains('h3', 'lya').should('be.visible')
         cy.contains('p', 'Sign in to your account').should('be.visible')
         cy.get('#email').should('be.visible')
         cy.get('#password').should('be.visible')
