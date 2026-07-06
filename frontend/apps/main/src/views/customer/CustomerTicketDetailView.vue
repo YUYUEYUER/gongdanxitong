@@ -74,8 +74,17 @@
             </div>
           </div>
 
-          <div class="mt-4 whitespace-pre-wrap text-sm leading-7 text-foreground">
-            {{ message.content }}
+          <div class="mt-4 text-sm leading-7 text-foreground">
+            <Letter
+              v-if="isHTMLMessage(message)"
+              :html="messageHTML(message)"
+              :allowedSchemas="['cid', 'https', 'http', 'mailto']"
+              :allowed-css-properties="extendedCssProperties"
+              class="native-html break-words"
+            />
+            <div v-else class="whitespace-pre-wrap break-words">
+              {{ message.content }}
+            </div>
           </div>
 
           <div v-if="message.attachments?.length" class="mt-4 flex flex-wrap gap-3">
@@ -248,6 +257,8 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import { Button } from '@shared-ui/components/ui/button'
+import { Letter } from 'vue-letter'
+import { allowedCssProperties } from 'lettersanitizer'
 import {
   CheckCircle2,
   CircleDashed,
@@ -265,6 +276,8 @@ import {
   customerTicketStatusClass,
   customerTicketStatusLabel
 } from '@/utils/customer-ticket-status'
+
+const extendedCssProperties = [...allowedCssProperties, 'transform', 'transform-origin']
 
 const route = useRoute()
 const router = useRouter()
@@ -337,6 +350,15 @@ function formatFileSize(value) {
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function isHTMLMessage(message) {
+  return String(message?.content_type || '').toLowerCase() === 'html'
+}
+
+function messageHTML(message) {
+  const html = String(message?.content || '')
+  return html.replace(/(?:<p>(?:\s|&nbsp;|<br\s*\/?>)*<\/p>\s*)+$/gi, '') || html
 }
 
 function triggerFileSelect() {
