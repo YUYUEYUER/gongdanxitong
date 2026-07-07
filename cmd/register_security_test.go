@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/ratelimit"
+	turnstilesvc "github.com/abhinavxd/libredesk/internal/turnstile"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/knadh/go-i18n"
 	"github.com/redis/go-redis/v9"
@@ -23,6 +25,7 @@ func testSecurityApp(t *testing.T) *App {
 		"_.name":"English",
 		"auth.csrfTokenMismatch":"Page state expired. Please refresh and try again.",
 		"auth.rateLimited":"Too many attempts. Please try again later.",
+		"auth.turnstileRequired":"Please complete the verification challenge.",
 		"globals.messages.badRequest":"Bad request",
 		"publicTicket.nameRequired":"Please enter your name.",
 		"validation.invalidEmail":"Invalid email address"
@@ -30,7 +33,7 @@ func testSecurityApp(t *testing.T) *App {
 	require.NoError(t, err)
 
 	lo := logf.New(logf.Opts{})
-	return &App{i18n: tr, lo: &lo}
+	return &App{ctx: context.Background(), i18n: tr, lo: &lo}
 }
 
 func testFastRequest(app *App, method, contentType string) *fastglue.Request {
@@ -136,6 +139,30 @@ func TestLoginRequestTurnstileResponse(t *testing.T) {
 
 	req.CFTurnstileResponse = ""
 	require.Equal(t, "legacy-token", req.turnstileResponse())
+}
+
+func TestCustomerLoginRequestTurnstileResponse(t *testing.T) {
+	req := customerLoginRequest{
+		CFTurnstileResponse: " cf-token ",
+		TurnstileToken:      "legacy-token",
+	}
+	require.Equal(t, "cf-token", req.turnstileResponse())
+
+	req.CFTurnstileResponse = ""
+	require.Equal(t, "legacy-token", req.turnstileResponse())
+}
+
+func TestHandleCustomerLoginRequiresTurnstileToken(t *testing.T) {
+	app := testSecurityApp(t)
+	app.turnstile = turnstilesvc.New(true, "site-key", "secret-key", app.lo)
+
+	req := testFastRequest(app, fasthttp.MethodPost, "application/json")
+	req.RequestCtx.Request.SetRequestURI("/api/v1/customer/auth/login")
+	req.RequestCtx.Request.SetBodyString(`{"email":"user@example.com","password":"Password1!"}`)
+
+	require.NoError(t, handleCustomerLogin(req))
+	require.Equal(t, fasthttp.StatusBadRequest, req.RequestCtx.Response.StatusCode())
+	require.Contains(t, string(req.RequestCtx.Response.Body()), "Please complete the verification challenge.")
 }
 
 func requireEnvelopeError(t *testing.T, err error, errorType string, code int) {

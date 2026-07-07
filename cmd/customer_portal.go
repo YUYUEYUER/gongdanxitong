@@ -28,8 +28,10 @@ type customerRegisterRequest struct {
 }
 
 type customerLoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email               string `json:"email"`
+	Password            string `json:"password"`
+	CFTurnstileResponse string `json:"cf-turnstile-response"`
+	TurnstileToken      string `json:"turnstile_token"`
 }
 
 type customerForgotPasswordRequest struct {
@@ -160,8 +162,22 @@ func handleCustomerLogin(r *fastglue.Request) error {
 	if err := r.Decode(&req, "json"); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
 	}
+	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
 	if req.Email == "" || req.Password == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.badRequest"), nil, envelope.InputError)
+	}
+	ip := realip.FromRequest(r.RequestCtx)
+	userAgent := string(r.RequestCtx.UserAgent())
+
+	if err := validateTurnstileToken(r, req.turnstileResponse(), turnstilesvc.WithExpectedAction(turnstileActionCustomerLogin)); err != nil {
+		app.lo.Warn(
+			"customer login turnstile failed",
+			"ip", ip,
+			"user_agent", userAgent,
+			"email_hash", sha256Hex(req.Email),
+			"error", err,
+		)
+		return sendErrorEnvelope(r, err)
 	}
 
 	customer, err := app.user.VerifyContactPassword(req.Email, []byte(req.Password))

@@ -14,7 +14,10 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-const turnstileActionCustomerRegister = "customer_register"
+const (
+	turnstileActionCustomerRegister = "customer_register"
+	turnstileActionCustomerLogin    = "customer_login"
+)
 
 func requireJSONPost(rctx *fasthttp.RequestCtx, app *App) error {
 	if string(rctx.Method()) != fasthttp.MethodPost {
@@ -42,6 +45,13 @@ func (req customerRegisterRequest) turnstileResponse() string {
 		return req.CFTurnstileResponse
 	}
 	return req.TurnstileToken
+}
+
+func (req customerLoginRequest) turnstileResponse() string {
+	if strings.TrimSpace(req.CFTurnstileResponse) != "" {
+		return strings.TrimSpace(req.CFTurnstileResponse)
+	}
+	return strings.TrimSpace(req.TurnstileToken)
 }
 
 func (req customerRegisterRequest) displayName() string {
