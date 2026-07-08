@@ -6,10 +6,23 @@
   font-size: 16px;
 }
 
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.15s;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
+}
+
 @layer base {
   html,
   body {
-    font-family: 'Plus Jakarta Sans', sans-serif;
+    font-family: 'Instrument Sans', sans-serif;
     min-height: 100%;
     overflow: hidden;
     margin: 0;
@@ -137,7 +150,8 @@
     --vis-text-color: var(--muted-foreground);
   }
 
-  :root {
+  :root,
+  .light {
     --background: 0 0% 100%;
     --foreground: 240 10% 3.9%;
 

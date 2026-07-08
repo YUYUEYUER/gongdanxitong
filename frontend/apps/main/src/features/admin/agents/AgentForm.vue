@@ -1,5 +1,5 @@
 <template>
-  <form @submit.prevent="onSubmit" class="space-y-8">
+  <form @submit.prevent="onSubmit" novalidate class="space-y-8">
     <!-- Summary Section -->
     <div class="bg-muted/30 box py-6 px-3" v-if="!isNewForm">
       <div class="flex items-start gap-6">
@@ -384,9 +384,9 @@ const isAPIKeyLoading = ref(false)
 
 onMounted(async () => {
   try {
-    const [teamsResp, rolesResp] = await Promise.allSettled([api.getTeams(), api.getRoles()])
-    teams.value = teamsResp.value.data.data
-    roles.value = rolesResp.value.data.data
+    const [teamsResp, rolesResp] = await Promise.allSettled([api.getTeamsCompact(), api.getRoles()])
+    if (teamsResp.status === 'fulfilled') teams.value = teamsResp.value.data.data
+    if (rolesResp.status === 'fulfilled') roles.value = rolesResp.value.data.data
   } catch (err) {
     emitter.emit(EMITTER_EVENTS.SHOW_TOAST, {
       variant: 'destructive',

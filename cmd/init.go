@@ -446,7 +446,7 @@ func initCSAT(db *sqlx.DB, i18n *i18n.I18n) *csat.Manager {
 
 // initWS inits websocket hub.
 func initWS(user *user.Manager) *ws.Hub {
-	return ws.NewHub(user)
+	return ws.NewHub(initLogger("ws"), user)
 }
 
 // getCustomStaticDir returns the custom static directory path from CLI flag or config.
@@ -715,6 +715,7 @@ func initEmailInbox(inboxRecord imodels.Inbox, msgStore inbox.MessageStore, usrS
 	}
 
 	config.From = inboxRecord.From
+	config.FromNameTemplate = inboxRecord.FromNameTemplate
 
 	if len(config.From) == 0 {
 		log.Printf("WARNING: No `from` email address set for `%s` inbox: Name: `%s`", inboxRecord.Channel, inboxRecord.Name)
@@ -741,6 +742,7 @@ func initEmailInbox(inboxRecord imodels.Inbox, msgStore inbox.MessageStore, usrS
 
 	inbox, err := email.New(msgStore, usrStore, email.Opts{
 		ID:                   inboxRecord.ID,
+		Name:                 inboxRecord.Name,
 		Config:               config,
 		Lo:                   initLogger("email_inbox"),
 		TokenRefreshCallback: tokenRefreshCallback,
@@ -770,6 +772,7 @@ func initLiveChatInbox(inboxRecord imodels.Inbox, msgStore inbox.MessageStore, u
 
 	inbox, err := livechat.New(msgStore, usrStore, livechat.Opts{
 		ID:            inboxRecord.ID,
+		Name:          inboxRecord.Name,
 		Config:        config,
 		Lo:            initLogger("livechat_inbox"),
 		SignAvatarURL: signAvatarURL,

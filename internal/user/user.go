@@ -78,6 +78,7 @@ type queries struct {
 	GetUser                       *sqlx.Stmt `query:"get-user"`
 	GetNotes                      *sqlx.Stmt `query:"get-notes"`
 	GetNote                       *sqlx.Stmt `query:"get-note"`
+	GetUserIDsByRole              *sqlx.Stmt `query:"get-user-ids-by-role"`
 	GetUserByExternalID           *sqlx.Stmt `query:"get-user-by-external-id"`
 	GetUsersCompact               string     `query:"get-users-compact"`
 	UpdateContact                 *sqlx.Stmt `query:"update-contact"`
@@ -151,8 +152,8 @@ func (u *Manager) VerifyPassword(email string, password []byte) (models.User, er
 }
 
 // GetAllUsers returns a list of all users.
-func (u *Manager) GetAllUsers(page, pageSize int, userTypes []string, order, orderBy string, filtersJSON string) ([]models.UserCompact, error) {
-	query, qArgs, err := u.makeUserListQuery(page, pageSize, userTypes, order, orderBy, filtersJSON)
+func (u *Manager) GetAllUsers(page, pageSize int, userTypes []string, order, orderBy string, filtersJSON, location string) ([]models.UserCompact, error) {
+	query, qArgs, err := u.makeUserListQuery(page, pageSize, userTypes, order, orderBy, filtersJSON, location)
 	if err != nil {
 		u.lo.Error("error creating user list query", "error", err)
 		return nil, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
@@ -200,7 +201,6 @@ func (u *Manager) GetContactOrVisitor(id int, email string) (models.User, error)
 	return u.Get(id, email, []string{models.UserTypeContact, models.UserTypeVisitor})
 }
 
-// GetSystemUser retrieves the system user.
 func (u *Manager) GetSystemUser() (models.User, error) {
 	return u.Get(0, models.SystemUserEmail, []string{models.UserTypeAgent})
 }
@@ -482,6 +482,15 @@ func (u *Manager) MergeVisitorToContact(visitorID, contactID int) error {
 	return nil
 }
 
+func (u *Manager) GetUserIDsByRole(roleID int) ([]int, error) {
+	var ids []int
+	if err := u.q.GetUserIDsByRole.Select(&ids, roleID); err != nil {
+		u.lo.Error("error fetching user ids by role", "role_id", roleID, "error", err)
+		return nil, err
+	}
+	return ids, nil
+}
+
 // ChangeSystemUserPassword updates the system user's password with a newly prompted one.
 func ChangeSystemUserPassword(ctx context.Context, db *sqlx.DB) error {
 	// Prompt for password and get hashed password
@@ -585,7 +594,7 @@ func updateSystemUserPassword(db *sqlx.DB, hashedPassword []byte) error {
 }
 
 // makeUserListQuery generates a query to fetch users based on the provided filters.
-func (u *Manager) makeUserListQuery(page, pageSize int, userTypes []string, order, orderBy, filtersJSON string) (string, []interface{}, error) {
+func (u *Manager) makeUserListQuery(page, pageSize int, userTypes []string, order, orderBy, filtersJSON, location string) (string, []interface{}, error) {
 	var qArgs []any
 	qArgs = append(qArgs, pq.Array(userTypes))
 	return dbutil.BuildPaginatedQuery(u.q.GetUsersCompact, qArgs, dbutil.PaginationOptions{
@@ -593,9 +602,10 @@ func (u *Manager) makeUserListQuery(page, pageSize int, userTypes []string, orde
 		OrderBy:  orderBy,
 		Page:     page,
 		PageSize: pageSize,
+		Location: location,
 	}, filtersJSON, dbutil.AllowedFields{
 		"users": {"email", "created_at", "updated_at"},
-	})
+	}, nil)
 }
 
 // verifyPassword compares the provided password with the stored password hash.

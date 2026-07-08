@@ -9,7 +9,7 @@
           <DialogDescription />
         </DialogHeader>
 
-        <form @submit="createConversation" class="flex flex-col flex-1 overflow-hidden">
+        <form @submit="createConversation" novalidate class="flex flex-col flex-1 overflow-hidden">
           <!-- Form Fields Section -->
           <div class="space-y-4 pb-2 flex-shrink-0">
             <div class="space-y-2">
@@ -321,6 +321,7 @@ const emailQuery = ref('')
 const conversationStore = useConversationStore()
 const macroStore = useMacroStore()
 let timeoutId = null
+let previousMacroView = ''
 const insertContent = ref('')
 const selectedContact = ref(null)
 const emailInputRef = ref(null)
@@ -367,6 +368,7 @@ onUnmounted(() => {
   clearTimeout(timeoutId)
   clearMediaFiles()
   conversationStore.resetMacro(MACRO_CONTEXT.NEW_CONVERSATION)
+  macroStore.setCurrentView(previousMacroView)
   emitter.emit(EMITTER_EVENTS.SET_NESTED_COMMAND, {
     command: null,
     open: false
@@ -374,6 +376,7 @@ onUnmounted(() => {
 })
 
 onMounted(() => {
+  previousMacroView = macroStore.currentView
   macroStore.setCurrentView('starting_conversation')
   emitter.emit(EMITTER_EVENTS.SET_NESTED_COMMAND, {
     command: 'apply-macro-to-new-conversation',

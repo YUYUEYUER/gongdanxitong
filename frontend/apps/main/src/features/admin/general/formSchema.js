@@ -44,8 +44,9 @@ export const createFormSchema = (t) =>
       })
       .max(500, {
         message: t('admin.general.maxAllowedFileUploadSize.valid')
-      }),
+    }),
     allowed_file_upload_extensions: z.array(z.string()).nullable().default([]).optional(),
     public_ticket_require_login: z.boolean().default(true),
-    public_ticket_require_order_number: z.boolean().default(false)
+    public_ticket_require_order_number: z.boolean().default(false),
+    show_conversation_subject: z.boolean().optional()
   })

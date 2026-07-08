@@ -13,7 +13,7 @@
       </AlertDialogHeader>
       <AlertDialogFooter>
         <AlertDialogCancel>{{ $t('globals.messages.cancel') }}</AlertDialogCancel>
-        <AlertDialogAction @click="processSend(true, true)">{{
+        <AlertDialogAction @click="processSend(true, true, deferredStatus)">{{
           $t('replyBox.sendAnyway')
         }}</AlertDialogAction>
       </AlertDialogFooter>
@@ -30,7 +30,7 @@
       </AlertDialogHeader>
       <AlertDialogFooter>
         <AlertDialogCancel>{{ $t('globals.messages.cancel') }}</AlertDialogCancel>
-        <AlertDialogAction @click="processSend(false, true)">{{
+        <AlertDialogAction @click="processSend(false, true, deferredStatus)">{{
           $t('replyBox.sendAnyway')
         }}</AlertDialogAction>
       </AlertDialogFooter>
@@ -103,6 +103,7 @@
           v-model:mentions="mentions"
           @toggleFullscreen="isEditorFullscreen = !isEditorFullscreen"
           @send="processSend"
+          @sendAndSetStatus="processSendAndSetStatus"
           @fileUpload="handleFileUpload"
           @fileDelete="handleFileDelete"
           @filesDropped="uploadFiles"
@@ -137,6 +138,7 @@
         v-model:mentions="mentions"
         @toggleFullscreen="isEditorFullscreen = !isEditorFullscreen"
         @send="processSend"
+        @sendAndSetStatus="processSendAndSetStatus"
         @fileUpload="handleFileUpload"
         @fileDelete="handleFileDelete"
         @filesDropped="uploadFiles"
@@ -148,7 +150,6 @@
 
 <script setup>
 import { ref, watch, computed, toRaw } from 'vue'
-import { useStorage } from '@vueuse/core'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import { EMITTER_EVENTS } from '@main/constants/emitterEvents.js'
 import { MACRO_CONTEXT } from '@main/constants/conversation'
@@ -158,6 +159,8 @@ import api from '@main/api'
 import { useI18n } from 'vue-i18n'
 import { useConversationStore } from '@main/stores/conversation'
 import { useInboxStore } from '@main/stores/inbox'
+import { useAiPromptStore } from '@main/stores/aiPrompt'
+import { useNotificationStore } from '@main/stores/notification'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -202,6 +205,7 @@ const formSchema = toTypedSchema(
 
 const { t } = useI18n()
 const conversationStore = useConversationStore()
+const notificationStore = useNotificationStore()
 const inboxStore = useInboxStore()
 const emitter = useEmitter()
 const userStore = useUserStore()
@@ -219,8 +223,26 @@ const {
   linkedModel: 'messages'
 })
 
-// Setup draft management composable
-const currentDraftKey = computed(() => conversationStore.current?.uuid || null)
+const messageType = ref('reply')
+const currentConversationUUID = computed(() => conversationStore.current?.uuid || null)
+watch(
+  currentConversationUUID,
+  async (uuid, prevUuid) => {
+    if (prevUuid) conversationStore.setSelectedDraftType(prevUuid, messageType.value)
+    if (!uuid) {
+      messageType.value = 'reply'
+      return
+    }
+    messageType.value = conversationStore.resolveDraftType(uuid)
+    // Prefetch may still be in flight on first load; re-resolve once drafts land.
+    await conversationStore.draftsReady
+    if (uuid !== currentConversationUUID.value) return
+    messageType.value = conversationStore.resolveDraftType(uuid)
+  },
+  { immediate: true }
+)
+
+// Setup draft management composable, keyed per conversation and message type.
 const {
   htmlContent,
   textContent,
@@ -228,41 +250,27 @@ const {
   clearDraft,
   loadedAttachments,
   loadedMacroActions
-} = useDraftManager(currentDraftKey, mediaFiles)
+} = useDraftManager(currentConversationUUID, messageType, mediaFiles)
 
 // Rest of existing state
 const openAIKeyPrompt = ref(false)
 const isOpenAIKeyUpdating = ref(false)
 const isEditorFullscreen = ref(false)
 const isSending = ref(false)
-const messageType = useStorage('replyBoxMessageType', 'reply')
 const to = ref('')
 const cc = ref('')
 const bcc = ref('')
 const showBcc = ref(false)
 const emailErrors = ref([])
-const aiPrompts = ref([])
+const aiPromptStore = useAiPromptStore()
+const aiPrompts = computed(() => aiPromptStore.prompts)
 const replyBoxContentRef = ref(null)
 const showContactEmailWarning = ref(false)
 const showMissingTagsWarning = ref(false)
+const deferredStatus = ref(null)
 const mentions = ref([])
 
-/**
- * Fetches AI prompts from the server.
- */
-const fetchAiPrompts = async () => {
-  try {
-    const resp = await api.getAiPrompts()
-    aiPrompts.value = resp.data.data
-  } catch (error) {
-    emitter.emit(EMITTER_EVENTS.SHOW_TOAST, {
-      variant: 'destructive',
-      description: handleHTTPError(error).message
-    })
-  }
-}
-
-fetchAiPrompts()
+aiPromptStore.fetchPrompts()
 
 /**
  * Handles the AI prompt selection event.
@@ -318,10 +326,7 @@ const hasTextContent = computed(() => {
   return textContent.value.trim().length > 0
 })
 
-/**
- * Processes the send action.
- */
-const processSend = async (skipContactEmailCheck = false, skipMissingTagsCheck = false) => {
+const processSend = async (skipContactEmailCheck = false, skipMissingTagsCheck = false, statusToSet = null) => {
   let hasMessageSendingErrored = false
   isEditorFullscreen.value = false
 
@@ -340,6 +345,7 @@ const processSend = async (skipContactEmailCheck = false, skipMissingTagsCheck =
     currentInbox?.prompt_tags_on_reply &&
     !(conversationStore.current.tags?.length > 0)
   ) {
+    deferredStatus.value = statusToSet
     showMissingTagsWarning.value = true
     return
   }
@@ -365,6 +371,7 @@ const processSend = async (skipContactEmailCheck = false, skipMissingTagsCheck =
             .map((e) => e.trim())
             .includes(contactEmail)
         ) {
+          deferredStatus.value = statusToSet
           showContactEmailWarning.value = true
           return
         }
@@ -440,6 +447,8 @@ const processSend = async (skipContactEmailCheck = false, skipMissingTagsCheck =
       if (isPrivate && response?.data?.data) {
         conversationStore.replacePendingMessage(convUUID, tempUUID, response.data.data)
       }
+
+      notificationStore.markAssignmentAsReadForConversation(convUUID)
     } catch (error) {
       hasMessageSendingErrored = true
       // Remove pending message and restore editor content.
@@ -470,14 +479,17 @@ const processSend = async (skipContactEmailCheck = false, skipMissingTagsCheck =
 
   // Clear state on success.
   if (!hasMessageSendingErrored) {
-    clearDraft(currentDraftKey.value)
+    clearDraft(convUUID, isPrivate ? 'private_note' : 'reply')
     conversationStore.resetMacro(MACRO_CONTEXT.REPLY)
     clearMediaFiles()
     emailErrors.value = []
     mentions.value = []
+    if (statusToSet) conversationStore.updateStatus(statusToSet)
   }
   isSending.value = false
 }
+
+const processSendAndSetStatus = (status) => processSend(false, false, status)
 
 /**
  * Watches for changes in the conversation's macro id and update message content.
@@ -496,15 +508,12 @@ watch(
   { deep: true }
 )
 
-/**
- * Watch loaded macro actions from draft and update conversation store.
- */
+// Reset first so a loaded draft never inherits the previous conversation's macro id/message_content (drafts store only actions).
 watch(
   loadedMacroActions,
   (actions) => {
-    if (actions.length > 0) {
-      conversationStore.setMacroActions([...toRaw(actions)], MACRO_CONTEXT.REPLY)
-    }
+    conversationStore.resetMacro(MACRO_CONTEXT.REPLY)
+    if (actions.length) conversationStore.setMacroActions([...toRaw(actions)], MACRO_CONTEXT.REPLY)
   },
   { deep: true }
 )
@@ -515,9 +524,7 @@ watch(
 watch(
   loadedAttachments,
   (attachments) => {
-    if (attachments.length > 0) {
-      setMediaFiles([...attachments])
-    }
+    setMediaFiles([...attachments])
   },
   { deep: true }
 )
@@ -552,13 +559,10 @@ watch(
   { deep: true, immediate: true }
 )
 
-// Clear media files and reset macro when conversation changes.
+// Media files and macro state are restored per draft by the draft manager; resetting here would race ahead of the save and drop them.
 watch(
   () => conversationStore.current?.uuid,
   () => {
-    clearMediaFiles()
-    conversationStore.resetMacro(MACRO_CONTEXT.REPLY)
-    // Focus editor on conversation change
     setTimeout(() => {
       replyBoxContentRef.value?.focus()
     }, 100)

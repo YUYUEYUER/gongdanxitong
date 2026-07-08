@@ -94,12 +94,21 @@
         </DropdownMenuItem>
       </DropdownMenuGroup>
       <DropdownMenuSeparator />
+      <DropdownMenuGroup>
+        <DropdownMenuItem @click="showShortcuts = true">
+          <Keyboard size="18" class="mr-2" />
+          {{ t('navigation.keyboardShortcuts') }}
+        </DropdownMenuItem>
+      </DropdownMenuGroup>
+      <DropdownMenuSeparator />
       <DropdownMenuItem @click="logout">
         <LogOut size="18" class="mr-2" />
         {{ t('navigation.logout') }}
       </DropdownMenuItem>
     </DropdownMenuContent>
   </DropdownMenu>
+
+  <KeyboardShortcutsDialog v-model:open="showShortcuts" />
 </template>
 
 <script setup>
@@ -117,15 +126,20 @@ import { SidebarMenuButton } from '@shared-ui/components/ui/sidebar'
 import { Avatar, AvatarFallback, AvatarImage } from '@shared-ui/components/ui/avatar'
 import StatusDot from '@shared-ui/components/StatusDot.vue'
 import { Switch } from '@shared-ui/components/ui/switch'
-import { ChevronsUpDown, CircleUserRound, LogOut } from 'lucide-vue-next'
+import { ChevronsUpDown, CircleUserRound, Keyboard, LogOut } from 'lucide-vue-next'
 import { useUserStore } from '../../stores/user'
 import api from '../../api'
+import { useRouter } from 'vue-router'
+import KeyboardShortcutsDialog from '../KeyboardShortcutsDialog.vue'
 
 import { useColorMode } from '@vueuse/core'
+import { ref } from 'vue'
 
 const mode = useColorMode()
 const userStore = useUserStore()
 const { t } = useI18n()
+const router = useRouter()
+const showShortcuts = ref(false)
 
 const logout = async () => {
   await api.logout()

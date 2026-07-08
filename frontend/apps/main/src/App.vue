@@ -99,7 +99,7 @@
         :userTeams="userStore.teams"
         :userViews="userViews"
         :sharedViews="sharedViewStore.sharedViewList"
-        @create-view="openCreateViewForm = true"
+        @create-view="createView"
         @edit-view="editView"
         @delete-view="deleteView"
         @create-conversation="() => (openCreateConversationDialog = true)"
@@ -191,9 +191,10 @@ watch(
   () => route.path,
   (path) => {
     if (path.startsWith('/inboxes') && path !== '/inboxes/search') {
-      lastInboxPath.value = path.replace(/\/conversation\/[^/]+$/, '')
+      lastInboxPath.value = path
     }
-  }
+  },
+  { immediate: true }
 )
 const userStore = useUserStore()
 const conversationStore = useConversationStore()
@@ -256,6 +257,11 @@ const initStores = async () => {
     tagStore.fetchTags(),
     customAttributeStore.fetchCustomAttributes()
   ])
+}
+
+const createView = () => {
+  view.value = {}
+  openCreateViewForm.value = true
 }
 
 const editView = (v) => {

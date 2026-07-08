@@ -19,7 +19,7 @@ SELECT
 FROM conversations
 JOIN users ON conversations.contact_id = users.id
 LEFT JOIN conversation_statuses cs ON conversations.status_id = cs.id
-WHERE users.email = $1
+WHERE users.email ILIKE '%' || $1 || '%'
 ORDER BY conversations.created_at DESC
 LIMIT 1000;
 
@@ -28,7 +28,7 @@ SELECT
     c.created_at as "conversation_created_at",
     c.reference_number as "conversation_reference_number",
     c.uuid as "conversation_uuid",
-    m.text_content,
+    LEFT(m.text_content, 200) AS text_content,
     cs.name as "conversation_status"
 FROM conversation_messages m
     JOIN conversations c ON m.conversation_id = c.id

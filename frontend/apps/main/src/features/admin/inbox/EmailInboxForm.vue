@@ -1,5 +1,5 @@
 <template>
-  <form @submit="onSubmit" class="space-y-6 w-full">
+  <form @submit="onSubmit" novalidate class="space-y-6 w-full">
     <!-- Basic Fields -->
     <FormField v-if="showFormFields" v-slot="{ componentField }" name="name">
       <FormItem>
@@ -23,6 +23,25 @@
         </FormControl>
         <FormDescription>
           {{ $t('admin.inbox.fromEmailAddress.description') }}
+        </FormDescription>
+        <FormMessage />
+      </FormItem>
+    </FormField>
+
+    <FormField v-if="showFormFields" v-slot="{ componentField }" name="from_name_template">
+      <FormItem>
+        <FormLabel>{{ $t('admin.inbox.fromNameTemplate') }}</FormLabel>
+        <FormControl>
+          <Input
+            type="text"
+            :placeholder="t('admin.inbox.fromNameTemplate.placeholder')"
+            v-bind="componentField"
+          />
+        </FormControl>
+        <FormDescription>
+          {{ $t('admin.inbox.fromNameTemplate.description') }}
+          <br />
+          {{ $t('admin.inbox.fromNameTemplate.variables') }}
         </FormDescription>
         <FormMessage />
       </FormItem>
@@ -869,6 +888,7 @@ const form = useForm({
   initialValues: {
     name: '',
     from: '',
+    from_name_template: '',
     reply_to: '',
     enabled: true,
     csat_enabled: false,

@@ -12,6 +12,7 @@ type General struct {
 	BusinessHoursID                string   `json:"app.business_hours_id"`
 	PublicTicketRequireLogin       bool     `json:"app.public_ticket_require_login"`
 	PublicTicketRequireOrderNumber bool     `json:"app.public_ticket_require_order_number"`
+	ShowConversationSubject        bool     `json:"app.show_conversation_subject"`
 }
 
 type EmailNotification struct {

@@ -88,6 +88,7 @@ CREATE TABLE inboxes (
 	prompt_tags_on_reply bool DEFAULT false NOT NULL,
 	config jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"from" TEXT NULL,
+	from_name_template TEXT NOT NULL DEFAULT '',
 	secret TEXT NULL,
 	linked_email_inbox_id INT REFERENCES inboxes(id) ON DELETE SET NULL,
 	CONSTRAINT constraint_inboxes_on_name CHECK (length("name") <= 140)
@@ -315,10 +316,12 @@ CREATE TABLE conversation_drafts (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     conversation_id BIGINT REFERENCES conversations(id) ON DELETE CASCADE ON UPDATE CASCADE NOT NULL,
     user_id BIGINT REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE NOT NULL,
+    type TEXT NOT NULL DEFAULT 'reply',
     content TEXT NOT NULL,
-	meta JSONB DEFAULT '{}'::jsonb NOT NULL
+	meta JSONB DEFAULT '{}'::jsonb NOT NULL,
+	CONSTRAINT constraint_conversation_drafts_on_type CHECK (type IN ('reply', 'private_note'))
 );
-CREATE UNIQUE INDEX index_uniq_conversation_drafts_on_conversation_id_and_user_id ON conversation_drafts (conversation_id, user_id);
+CREATE UNIQUE INDEX index_uniq_conversation_drafts_on_conversation_id_and_user_id_and_type ON conversation_drafts (conversation_id, user_id, type);
 
 DROP TABLE IF EXISTS macros CASCADE;
 CREATE TABLE macros (
@@ -727,6 +730,7 @@ VALUES
 	('app.business_hours_id', '""'::jsonb),
 	('app.public_ticket_require_login', 'true'::jsonb),
 	('app.public_ticket_require_order_number', 'false'::jsonb),
+	('app.show_conversation_subject', 'true'::jsonb),
     ('notification.email.username', '"admin@yourcompany.com"'::jsonb),
     ('notification.email.host', '""'::jsonb),
     ('notification.email.port', '587'::jsonb),
