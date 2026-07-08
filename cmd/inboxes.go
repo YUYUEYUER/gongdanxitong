@@ -369,20 +369,39 @@ func validateEmailConfig(app *App, configJSON json.RawMessage) error {
 	}
 
 	// Validate SMTP configs.
-	for i, smtp := range cfg.SMTP {
-		if smtp.Host == "" {
-			return envelope.NewError(envelope.InputError, app.i18n.Ts("globals.messages.empty", "name", "smtp.host"), nil)
+	outboundProvider := cfg.OutboundProvider
+	if outboundProvider == "" {
+		outboundProvider = imodels.OutboundProviderSMTP
+	}
+	switch outboundProvider {
+	case imodels.OutboundProviderSMTP:
+		if len(cfg.SMTP) == 0 {
+			return envelope.NewError(envelope.InputError, app.i18n.T("inbox.emptySMTP"), nil)
 		}
-		if smtp.Port <= 0 {
-			return envelope.NewError(envelope.InputError, app.i18n.T("validation.invalidPortValue"), nil)
-		}
-		// Validate auth_protocol for password auth.
-		if cfg.AuthType != imodels.AuthTypeOAuth2 {
-			validAuthProtocols := map[string]bool{"": true, "none": true, "plain": true, "login": true, "cram": true}
-			if !validAuthProtocols[cfg.SMTP[i].AuthProtocol] {
-				return envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.somethingWentWrong"), nil)
+		for i, smtp := range cfg.SMTP {
+			if smtp.Host == "" {
+				return envelope.NewError(envelope.InputError, app.i18n.Ts("globals.messages.empty", "name", "smtp.host"), nil)
+			}
+			if smtp.Port <= 0 {
+				return envelope.NewError(envelope.InputError, app.i18n.T("validation.invalidPortValue"), nil)
+			}
+			// Validate auth_protocol for password auth.
+			if cfg.AuthType != imodels.AuthTypeOAuth2 {
+				validAuthProtocols := map[string]bool{"": true, "none": true, "plain": true, "login": true, "cram": true}
+				if !validAuthProtocols[cfg.SMTP[i].AuthProtocol] {
+					return envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.somethingWentWrong"), nil)
+				}
 			}
 		}
+	case imodels.OutboundProviderResend:
+		if cfg.Resend == nil {
+			return envelope.NewError(envelope.InputError, app.i18n.Ts("globals.messages.empty", "name", "resend"), nil)
+		}
+		if cfg.Resend.APIKey == "" {
+			return envelope.NewError(envelope.InputError, app.i18n.Ts("globals.messages.empty", "name", "resend.api_key"), nil)
+		}
+	default:
+		return envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 
 	// Validate IMAP configs.
@@ -432,6 +451,7 @@ func trimInboxFields(inb *imodels.Inbox) error {
 // Passwords and secrets are intentionally NOT trimmed.
 func trimEmailConfig(cfg *imodels.Config) {
 	cfg.ReplyTo = strings.TrimSpace(cfg.ReplyTo)
+	cfg.OutboundProvider = strings.TrimSpace(cfg.OutboundProvider)
 
 	// Trim IMAP configs.
 	for i := range cfg.IMAP {
@@ -452,5 +472,9 @@ func trimEmailConfig(cfg *imodels.Config) {
 		cfg.OAuth.Provider = strings.TrimSpace(cfg.OAuth.Provider)
 		cfg.OAuth.ClientID = strings.TrimSpace(cfg.OAuth.ClientID)
 		cfg.OAuth.TenantID = strings.TrimSpace(cfg.OAuth.TenantID)
+	}
+
+	if cfg.Resend != nil {
+		cfg.Resend.APIURL = strings.TrimSpace(cfg.Resend.APIURL)
 	}
 }

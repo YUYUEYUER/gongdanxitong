@@ -345,6 +345,8 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 			OAuth                map[string]string `json:"oauth"`
 			IMAP                 []map[string]any  `json:"imap"`
 			SMTP                 []map[string]any  `json:"smtp"`
+			Resend               map[string]any    `json:"resend"`
+			OutboundProvider     string            `json:"outbound_provider"`
 			ReplyTo              string            `json:"reply_to"`
 			EnablePlusAddressing bool              `json:"enable_plus_addressing"`
 		}
@@ -353,6 +355,8 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 			OAuth                map[string]string `json:"oauth"`
 			IMAP                 []map[string]any  `json:"imap"`
 			SMTP                 []map[string]any  `json:"smtp"`
+			Resend               map[string]any    `json:"resend"`
+			OutboundProvider     string            `json:"outbound_provider"`
 			ReplyTo              string            `json:"reply_to"`
 			EnablePlusAddressing bool              `json:"enable_plus_addressing"`
 		}
@@ -373,7 +377,11 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 			return imodels.Inbox{}, envelope.NewError(envelope.InputError, m.i18n.T("inbox.emptyIMAP"), nil)
 		}
 
-		if len(updateCfg.SMTP) == 0 {
+		outboundProvider := updateCfg.OutboundProvider
+		if outboundProvider == "" {
+			outboundProvider = imodels.OutboundProviderSMTP
+		}
+		if outboundProvider == imodels.OutboundProviderSMTP && len(updateCfg.SMTP) == 0 {
 			return imodels.Inbox{}, envelope.NewError(envelope.InputError, m.i18n.T("inbox.emptySMTP"), nil)
 		}
 
@@ -400,6 +408,15 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 				if updateCfg.OAuth[k] == "" {
 					updateCfg.OAuth[k] = v
 				}
+			}
+		}
+
+		if currentCfg.Resend != nil {
+			if updateCfg.Resend == nil {
+				updateCfg.Resend = make(map[string]any)
+			}
+			if updateCfg.Resend["api_key"] == "" {
+				updateCfg.Resend["api_key"] = currentCfg.Resend["api_key"]
 			}
 		}
 
@@ -635,6 +652,16 @@ func (m *Manager) encryptInboxConfig(config json.RawMessage) (json.RawMessage, e
 		}
 	}
 
+	if resendMap, ok := cfg["resend"].(map[string]any); ok {
+		if apiKey, ok := resendMap["api_key"].(string); ok && apiKey != "" {
+			encrypted, err := crypto.Encrypt(apiKey, m.encryptionKey)
+			if err != nil {
+				return nil, fmt.Errorf("encrypting Resend API key: %w", err)
+			}
+			resendMap["api_key"] = encrypted
+		}
+	}
+
 	encrypted, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("marshalling encrypted config: %w", err)
@@ -697,6 +724,18 @@ func (m *Manager) decryptInboxConfig(config json.RawMessage) (json.RawMessage, e
 					continue
 				}
 				oauthMap[fieldName] = decrypted
+			}
+		}
+	}
+
+	if resendMap, ok := cfg["resend"].(map[string]any); ok {
+		if apiKey, ok := resendMap["api_key"].(string); ok && apiKey != "" {
+			decrypted, err := crypto.Decrypt(apiKey, m.encryptionKey)
+			if err != nil {
+				m.lo.Error("error decrypting Resend API key, clearing field", "error", err)
+				resendMap["api_key"] = ""
+			} else {
+				resendMap["api_key"] = decrypted
 			}
 		}
 	}

@@ -50,10 +50,12 @@ const submitForm = (values) => {
   if (inbox.value.channel === 'email') {
     const config = {
       auth_type: values.auth_type,
+      outbound_provider: values.outbound_provider,
       reply_to: values.reply_to,
       enable_plus_addressing: values.enable_plus_addressing,
       imap: [{ ...values.imap }],
-      smtp: [{ ...values.smtp }]
+      smtp: values.smtp ? [{ ...values.smtp }] : [],
+      resend: values.resend
     }
 
     if (values.auth_type === AUTH_TYPE_OAUTH2) {
@@ -66,27 +68,30 @@ const submitForm = (values) => {
       config
     }
 
-    if (payload.config.imap[0].password?.includes('•')) {
+    if (isMaskedSecret(payload.config.imap[0].password)) {
       payload.config.imap[0].password = ''
     }
 
     if (payload.config.auth_type === AUTH_TYPE_OAUTH2) {
-      if (payload.config.oauth.access_token?.includes('•')) {
+      if (isMaskedSecret(payload.config.oauth.access_token)) {
         payload.config.oauth.access_token = ''
       }
-      if (payload.config.oauth.client_secret?.includes('•')) {
+      if (isMaskedSecret(payload.config.oauth.client_secret)) {
         payload.config.oauth.client_secret = ''
       }
-      if (payload.config.oauth.refresh_token?.includes('•')) {
+      if (isMaskedSecret(payload.config.oauth.refresh_token)) {
         payload.config.oauth.refresh_token = ''
       }
     }
 
     payload.config.smtp.forEach((smtp) => {
-      if (smtp.password?.includes('•')) {
+      if (isMaskedSecret(smtp.password)) {
         smtp.password = ''
       }
     })
+    if (isMaskedSecret(payload.config.resend?.api_key)) {
+      payload.config.resend.api_key = ''
+    }
   } else if (inbox.value.channel === 'livechat') {
     payload = {
       ...values,
@@ -114,6 +119,10 @@ const updateInbox = async (payload) => {
   }
 }
 
+function isMaskedSecret(value) {
+  return typeof value === 'string' && value.includes('\u2022')
+}
+
 onMounted(async () => {
   try {
     formLoading.value = true
@@ -133,6 +142,8 @@ onMounted(async () => {
     }
     inboxData.auth_type = inboxData?.config?.auth_type || AUTH_TYPE_PASSWORD
     inboxData.oauth = inboxData?.config?.oauth || {}
+    inboxData.outbound_provider = inboxData?.config?.outbound_provider || 'smtp'
+    inboxData.resend = inboxData?.config?.resend || {}
     inboxData.enable_plus_addressing = inboxData?.config?.enable_plus_addressing || false
     inboxData.reply_to = inboxData?.config?.reply_to || ''
     inbox.value = inboxData

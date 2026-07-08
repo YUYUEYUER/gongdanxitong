@@ -129,6 +129,29 @@
       </FormItem>
     </FormField>
 
+    <FormField
+      v-if="showFormFields && !isOAuthInbox"
+      v-slot="{ componentField }"
+      name="outbound_provider"
+    >
+      <FormItem>
+        <FormLabel>{{ $t('admin.inbox.outboundProvider') }}</FormLabel>
+        <FormControl>
+          <Select v-bind="componentField">
+            <SelectTrigger>
+              <SelectValue :placeholder="t('admin.inbox.outboundProvider.placeholder')" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem :value="OUTBOUND_PROVIDER_SMTP">SMTP</SelectItem>
+              <SelectItem :value="OUTBOUND_PROVIDER_RESEND">Resend</SelectItem>
+            </SelectContent>
+          </Select>
+        </FormControl>
+        <FormDescription>{{ $t('admin.inbox.outboundProvider.description') }}</FormDescription>
+        <FormMessage />
+      </FormItem>
+    </FormField>
+
     <FormField v-if="setupMethod" v-slot="{ componentField }" name="auth_type">
       <FormItem>
         <FormControl>
@@ -508,7 +531,7 @@
     </div>
 
     <!-- SMTP Section -->
-    <div v-show="!isOAuthInbox && setupMethod === 'manual'" class="box p-4 space-y-4">
+    <div v-show="!isOAuthInbox && setupMethod === 'manual' && outboundProvider === OUTBOUND_PROVIDER_SMTP" class="box p-4 space-y-4">
       <h3 class="font-semibold">{{ $t('admin.inbox.smtpConfig') }}</h3>
 
       <FormField v-slot="{ componentField }" name="smtp.host">
@@ -667,6 +690,32 @@
       </FormField>
     </div>
 
+    <div v-show="!isOAuthInbox && setupMethod === 'manual' && outboundProvider === OUTBOUND_PROVIDER_RESEND" class="box p-4 space-y-4">
+      <h3 class="font-semibold">{{ $t('admin.inbox.resendConfig') }}</h3>
+
+      <FormField v-slot="{ componentField }" name="resend.api_key">
+        <FormItem>
+          <FormLabel>API Key</FormLabel>
+          <FormControl>
+            <Input type="password" placeholder="re_..." v-bind="componentField" />
+          </FormControl>
+          <FormDescription>{{ $t('admin.inbox.resendApiKey.description') }}</FormDescription>
+          <FormMessage />
+        </FormItem>
+      </FormField>
+
+      <FormField v-slot="{ componentField }" name="resend.api_url">
+        <FormItem>
+          <FormLabel>API URL</FormLabel>
+          <FormControl>
+            <Input type="text" placeholder="https://api.resend.com/emails" v-bind="componentField" />
+          </FormControl>
+          <FormDescription>{{ $t('admin.inbox.resendApiURL.description') }}</FormDescription>
+          <FormMessage />
+        </FormItem>
+      </FormField>
+    </div>
+
     <Button type="submit" :is-loading="isLoading" :disabled="isLoading">
       {{ submitLabel }}
     </Button>
@@ -819,6 +868,8 @@ import { EMITTER_EVENTS } from '@/constants/emitterEvents.js'
 import {
   AUTH_TYPE_PASSWORD,
   AUTH_TYPE_OAUTH2,
+  OUTBOUND_PROVIDER_RESEND,
+  OUTBOUND_PROVIDER_SMTP,
   PROVIDER_GOOGLE,
   PROVIDER_MICROSOFT
 } from '@/constants/auth.js'
@@ -895,6 +946,11 @@ const form = useForm({
     prompt_tags_on_reply: false,
     enable_plus_addressing: true,
     auth_type: AUTH_TYPE_PASSWORD,
+    outbound_provider: OUTBOUND_PROVIDER_SMTP,
+    resend: {
+      api_key: '',
+      api_url: ''
+    },
     imap: {
       host: 'imap.gmail.com',
       port: 993,
@@ -938,6 +994,7 @@ const oauthClientId = computed(() => {
 })
 
 const isMicrosoftInbox = computed(() => form.values.oauth?.provider === PROVIDER_MICROSOFT)
+const outboundProvider = computed(() => form.values.outbound_provider || OUTBOUND_PROVIDER_SMTP)
 
 const submitLabel = computed(() => {
   return (

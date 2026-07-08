@@ -236,7 +236,6 @@ import { useEmitter } from '../../../composables/useEmitter.js'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import { timeZones } from '../../../constants/timezones.js'
 import { useI18n } from 'vue-i18n'
-import SwitchField from '@shared-ui/components/SwitchField.vue'
 import api from '../../../api/index.js'
 
 const emitter = useEmitter()

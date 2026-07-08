@@ -28,9 +28,11 @@ type Email struct {
 	smtpPoolsToken       string
 	smtpCfg              []models.SMTPConfig
 	imapCfg              []models.IMAPConfig
+	resendCfg            *models.ResendConfig
 	oauth                *models.OAuthConfig
 	oauthMu              sync.RWMutex
 	authType             string
+	outboundProvider     string
 	headers              map[string]string
 	lo                   *logf.Logger
 	from                 string
@@ -59,9 +61,18 @@ type Opts struct {
 
 // New returns a new instance of the email inbox.
 func New(store inbox.MessageStore, userStore inbox.UserStore, opts Opts) (*Email, error) {
-	pools, err := NewSmtpPool(opts.Config.SMTP, opts.Config.OAuth)
-	if err != nil {
-		return nil, err
+	outboundProvider := opts.Config.OutboundProvider
+	if outboundProvider == "" {
+		outboundProvider = models.OutboundProviderSMTP
+	}
+
+	var pools []*smtppool.Pool
+	var err error
+	if outboundProvider == models.OutboundProviderSMTP {
+		pools, err = NewSmtpPool(opts.Config.SMTP, opts.Config.OAuth)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var poolsToken string
@@ -78,6 +89,7 @@ func New(store inbox.MessageStore, userStore inbox.UserStore, opts Opts) (*Email
 		replyTo:              opts.Config.ReplyTo,
 		smtpCfg:              opts.Config.SMTP,
 		imapCfg:              opts.Config.IMAP,
+		resendCfg:            opts.Config.Resend,
 		lo:                   opts.Lo,
 		smtpPools:            pools,
 		smtpPoolsToken:       poolsToken,
@@ -85,6 +97,7 @@ func New(store inbox.MessageStore, userStore inbox.UserStore, opts Opts) (*Email
 		userStore:            userStore,
 		oauth:                opts.Config.OAuth,
 		authType:             opts.Config.AuthType,
+		outboundProvider:     outboundProvider,
 		enablePlusAddressing: opts.Config.EnablePlusAddressing,
 		tokenRefreshCallback: opts.TokenRefreshCallback,
 	}
@@ -150,6 +163,8 @@ func (e *Email) getCurrentConfig() models.Config {
 	return models.Config{
 		SMTP:                 e.smtpCfg,
 		IMAP:                 e.imapCfg,
+		Resend:               e.resendCfg,
+		OutboundProvider:     e.outboundProvider,
 		From:                 e.from,
 		FromNameTemplate:     e.fromNameTemplate,
 		ReplyTo:              e.replyTo,
