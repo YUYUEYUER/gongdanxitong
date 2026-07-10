@@ -120,6 +120,7 @@ type queries struct {
 	ActivateExistingPortalUser         *sqlx.Stmt `query:"activate-existing-portal-user"`
 	InsertPortalUser                   *sqlx.Stmt `query:"insert-portal-user"`
 	DeleteCustomerRegistration         *sqlx.Stmt `query:"delete-customer-registration"`
+	DeleteCustomerRegistrationByEmail  *sqlx.Stmt `query:"delete-customer-registration-by-email"`
 	DeleteNote                         *sqlx.Stmt `query:"delete-note"`
 	InsertAgent                        *sqlx.Stmt `query:"insert-agent"`
 	InsertContactWithExtID             *sqlx.Stmt `query:"insert-contact-with-external-id"`

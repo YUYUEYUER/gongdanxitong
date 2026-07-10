@@ -9,7 +9,6 @@ import (
 	cmodels "github.com/abhinavxd/libredesk/internal/conversation/models"
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	inboxsvc "github.com/abhinavxd/libredesk/internal/inbox"
-	notifier "github.com/abhinavxd/libredesk/internal/notification"
 	tmpl "github.com/abhinavxd/libredesk/internal/template"
 	turnstilesvc "github.com/abhinavxd/libredesk/internal/turnstile"
 	"github.com/abhinavxd/libredesk/internal/user"
@@ -22,6 +21,8 @@ type customerRegisterRequest struct {
 	FirstName           string `json:"first_name"`
 	LastName            string `json:"last_name"`
 	Email               string `json:"email"`
+	Password            string `json:"password"`
+	ConfirmPassword     string `json:"confirm_password"`
 	CFTurnstileResponse string `json:"cf-turnstile-response"`
 	TurnstileToken      string `json:"turnstile_token"`
 }
@@ -124,7 +125,7 @@ func handleCustomerRegister(r *fastglue.Request) error {
 
 	ip := requestClientIP(app, r.RequestCtx)
 	userAgent := string(r.RequestCtx.UserAgent())
-	if err := checkCustomerRegisterRateLimit(r.RequestCtx, app, ip, userAgent, req); err != nil {
+	if err := checkCustomerRegisterIPRateLimit(r.RequestCtx, app, ip, userAgent, req); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
@@ -138,30 +139,15 @@ func handleCustomerRegister(r *fastglue.Request) error {
 		)
 		return sendErrorEnvelope(r, err)
 	}
-
-	token, err := app.user.BeginCustomerPortalRegistration(req.FirstName, req.LastName, req.Email)
-	if err != nil {
+	if err := checkCustomerRegisterIdentityRateLimit(r.RequestCtx, app, ip, userAgent, req); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
-	if token != "" {
-		content, renderErr := app.tmpl.RenderInMemoryTemplate(tmpl.TmplCustomerVerifyEmail, map[string]string{
-			"VerificationToken": token,
-		})
-		if renderErr != nil {
-			app.lo.Error("error rendering customer verification template", "error", renderErr)
-		} else if sendErr := app.notifier.Send(notifier.Message{
-			RecipientEmails: []string{req.Email},
-			Subject:         "Verify your customer portal email",
-			Content:         content,
-			Provider:        notifier.ProviderEmail,
-		}); sendErr != nil {
-			// Keep the public response identical for existing and new emails.
-			app.lo.Error("error sending customer verification email", "error", sendErr)
-		}
+	customer, err := app.user.RegisterCustomerPortal(req.FirstName, req.LastName, req.Email, req.Password)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
 	}
-
-	return r.SendEnvelope(map[string]bool{"verification_required": true})
+	return sendCustomerAuthSession(r, app, customer)
 }
 
 func handleCustomerVerifyEmail(r *fastglue.Request) error {
@@ -189,26 +175,7 @@ func handleCustomerVerifyEmail(r *fastglue.Request) error {
 	if err != nil {
 		return sendErrorEnvelope(r, err)
 	}
-	if err := app.customerAuth.SaveSession(amodels.User{
-		ID:             customer.ID,
-		Email:          customer.Email.String,
-		FirstName:      customer.FirstName,
-		LastName:       customer.LastName,
-		Type:           customer.Type,
-		SessionVersion: customer.SessionVersion,
-	}, r); err != nil {
-		app.lo.Error("error saving verified customer session", "error", err)
-		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
-	}
-	if err := app.customerAuth.SetCSRFCookie(r); err != nil {
-		app.lo.Error("error setting csrf cookie", "error", err)
-		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
-	}
-	if err := app.user.UpdateLastLoginAt(customer.ID); err != nil {
-		return sendErrorEnvelope(r, err)
-	}
-
-	return r.SendEnvelope(toCustomerAuthResponse(customer))
+	return sendCustomerAuthSession(r, app, customer)
 }
 
 func handleCustomerLogin(r *fastglue.Request) error {
@@ -251,26 +218,7 @@ func handleCustomerLogin(r *fastglue.Request) error {
 		return sendErrorEnvelope(r, envelope.NewError(envelope.PermissionError, app.i18n.T("user.accountDisabled"), nil))
 	}
 
-	if err := app.customerAuth.SaveSession(amodels.User{
-		ID:             customer.ID,
-		Email:          customer.Email.String,
-		FirstName:      customer.FirstName,
-		LastName:       customer.LastName,
-		Type:           customer.Type,
-		SessionVersion: customer.SessionVersion,
-	}, r); err != nil {
-		app.lo.Error("error saving customer session", "error", err)
-		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
-	}
-	if err := app.customerAuth.SetCSRFCookie(r); err != nil {
-		app.lo.Error("error setting csrf cookie", "error", err)
-		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
-	}
-	if err := app.user.UpdateLastLoginAt(customer.ID); err != nil {
-		return sendErrorEnvelope(r, err)
-	}
-
-	return r.SendEnvelope(toCustomerAuthResponse(customer))
+	return sendCustomerAuthSession(r, app, customer)
 }
 
 func handleCustomerLogout(r *fastglue.Request) error {
@@ -336,12 +284,12 @@ func handleCustomerForgotPassword(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.errorSendingPasswordResetEmail"), nil, envelope.GeneralError)
 	}
 
-	if err := app.notifier.Send(notifier.Message{
-		RecipientEmails: []string{customer.Email.String},
-		Subject:         "Customer password reset",
-		Content:         content,
-		Provider:        notifier.ProviderEmail,
-	}); err != nil {
+	if err := sendCustomerPortalEmail(
+		app.inbox,
+		customer.Email.String,
+		"Customer password reset",
+		content,
+	); err != nil {
 		app.lo.Error("error sending customer password reset email", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.errorSendingPasswordResetEmail"), nil, envelope.GeneralError)
 	}
@@ -559,6 +507,28 @@ func toCustomerAuthResponse(customer umodels.User) customerAuthResponse {
 		LastName:  customer.LastName,
 		Email:     customer.Email.String,
 	}
+}
+
+func sendCustomerAuthSession(r *fastglue.Request, app *App, customer umodels.User) error {
+	if err := app.customerAuth.SaveSession(amodels.User{
+		ID:             customer.ID,
+		Email:          customer.Email.String,
+		FirstName:      customer.FirstName,
+		LastName:       customer.LastName,
+		Type:           customer.Type,
+		SessionVersion: customer.SessionVersion,
+	}, r); err != nil {
+		app.lo.Error("error saving customer session", "error", err)
+		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
+	}
+	if err := app.customerAuth.SetCSRFCookie(r); err != nil {
+		app.lo.Error("error setting csrf cookie", "error", err)
+		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
+	}
+	if err := app.user.UpdateLastLoginAt(customer.ID); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	return r.SendEnvelope(toCustomerAuthResponse(customer))
 }
 
 func calcTotalPages(total, pageSize int) int {

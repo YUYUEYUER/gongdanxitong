@@ -12,6 +12,7 @@ import (
 
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
+	"github.com/abhinavxd/libredesk/internal/user"
 	"github.com/valyala/fasthttp"
 )
 
@@ -69,24 +70,51 @@ func validateCustomerRegisterFields(app *App, req customerRegisterRequest) error
 	if utf8.RuneCountInString(req.FirstName) > 140 || utf8.RuneCountInString(req.LastName) > 140 {
 		return envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.badRequest"), nil)
 	}
+	if !user.IsStrongPassword(req.Password) {
+		return envelope.NewError(
+			envelope.InputError,
+			app.i18n.Ts("globals.messages.strongPassword", "min", "10", "max", "72"),
+			nil,
+		)
+	}
+	if req.Password != req.ConfirmPassword {
+		return envelope.NewError(envelope.InputError, app.i18n.T("auth.passwordsDoNotMatch"), nil)
+	}
 	return nil
 }
 
-func checkCustomerRegisterRateLimit(ctx context.Context, app *App, ip, userAgent string, req customerRegisterRequest) error {
+type registerRateLimitSubject struct {
+	kind  string
+	value string
+}
+
+func checkCustomerRegisterIPRateLimit(ctx context.Context, app *App, ip, userAgent string, req customerRegisterRequest) error {
+	return checkCustomerRegisterRateLimitSubjects(ctx, app, ip, userAgent, req, []registerRateLimitSubject{
+		{kind: "ip", value: ip},
+	})
+}
+
+func checkCustomerRegisterIdentityRateLimit(ctx context.Context, app *App, ip, userAgent string, req customerRegisterRequest) error {
+	return checkCustomerRegisterRateLimitSubjects(ctx, app, ip, userAgent, req, []registerRateLimitSubject{
+		{kind: "email", value: req.Email},
+		{kind: "name", value: strings.ToLower(req.displayName())},
+	})
+}
+
+func checkCustomerRegisterRateLimitSubjects(
+	ctx context.Context,
+	app *App,
+	ip string,
+	userAgent string,
+	req customerRegisterRequest,
+	subjects []registerRateLimitSubject,
+) error {
 	if app.rateLimit == nil {
 		return nil
 	}
 
 	window := registerRateLimitWindow()
 	maxAttempts := registerRateLimitMaxAttempts()
-	subjects := []struct {
-		kind  string
-		value string
-	}{
-		{kind: "ip", value: ip},
-		{kind: "email", value: req.Email},
-		{kind: "name", value: strings.ToLower(req.displayName())},
-	}
 
 	for _, subject := range subjects {
 		if strings.TrimSpace(subject.value) == "" {

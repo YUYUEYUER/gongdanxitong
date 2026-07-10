@@ -255,6 +255,9 @@ RETURNING id;
 -- name: delete-customer-registration
 DELETE FROM customer_portal_registrations WHERE id = $1;
 
+-- name: delete-customer-registration-by-email
+DELETE FROM customer_portal_registrations WHERE lower(email) = lower($1);
+
 -- name: insert-agent
 WITH inserted_user AS (
   INSERT INTO users (email, type, first_name, last_name, "password", avatar_url)

@@ -24,10 +24,12 @@ func testSecurityApp(t *testing.T) *App {
 		"_.code":"en",
 		"_.name":"English",
 		"auth.csrfTokenMismatch":"Page state expired. Please refresh and try again.",
+		"auth.passwordsDoNotMatch":"Passwords do not match.",
 		"auth.rateLimited":"Too many attempts. Please try again later.",
 		"auth.turnstileRequired":"Please complete the verification challenge.",
 		"globals.messages.badRequest":"Bad request",
 		"globals.messages.somethingWentWrong":"Something went wrong",
+		"globals.messages.strongPassword":"Password must be between {min} and {max} characters long.",
 		"globals.messages.tooManyRequests":"Too many requests",
 		"publicTicket.nameRequired":"Please enter your name.",
 		"validation.invalidEmail":"Invalid email address"
@@ -124,9 +126,25 @@ func TestValidateCustomerRegisterFields(t *testing.T) {
 	}), envelope.InputError, fasthttp.StatusBadRequest)
 
 	require.NoError(t, validateCustomerRegisterFields(app, customerRegisterRequest{
-		FirstName: "User",
-		Email:     "user@example.com",
+		FirstName:       "User",
+		Email:           "user@example.com",
+		Password:        "StrongPass!123",
+		ConfirmPassword: "StrongPass!123",
 	}))
+
+	requireEnvelopeError(t, validateCustomerRegisterFields(app, customerRegisterRequest{
+		FirstName:       "User",
+		Email:           "user@example.com",
+		Password:        "weak",
+		ConfirmPassword: "weak",
+	}), envelope.InputError, fasthttp.StatusBadRequest)
+
+	requireEnvelopeError(t, validateCustomerRegisterFields(app, customerRegisterRequest{
+		FirstName:       "User",
+		Email:           "user@example.com",
+		Password:        "StrongPass!123",
+		ConfirmPassword: "DifferentPass!123",
+	}), envelope.InputError, fasthttp.StatusBadRequest)
 }
 
 func TestCheckCustomerRegisterRateLimit(t *testing.T) {
@@ -141,10 +159,10 @@ func TestCheckCustomerRegisterRateLimit(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		require.NoError(t, checkCustomerRegisterRateLimit(t.Context(), app, "203.0.113.10", "test-agent", req))
+		require.NoError(t, checkCustomerRegisterIPRateLimit(t.Context(), app, "203.0.113.10", "test-agent", req))
 	}
 
-	err := checkCustomerRegisterRateLimit(t.Context(), app, "203.0.113.10", "test-agent", req)
+	err := checkCustomerRegisterIPRateLimit(t.Context(), app, "203.0.113.10", "test-agent", req)
 	requireEnvelopeError(t, err, envelope.RateLimitError, fasthttp.StatusTooManyRequests)
 }
 
@@ -155,7 +173,7 @@ func TestCheckCustomerRegisterRateLimitFailsClosed(t *testing.T) {
 	app.rateLimit = ratelimit.New(client)
 	srv.Close()
 
-	err := checkCustomerRegisterRateLimit(t.Context(), app, "203.0.113.10", "test-agent", customerRegisterRequest{
+	err := checkCustomerRegisterIPRateLimit(t.Context(), app, "203.0.113.10", "test-agent", customerRegisterRequest{
 		FirstName: "Rate",
 		Email:     "rate@example.com",
 	})
@@ -206,6 +224,20 @@ func TestHandleCustomerLoginRequiresTurnstileToken(t *testing.T) {
 	req.RequestCtx.Request.Header.Set("X-CSRFTOKEN", "same-token")
 
 	require.NoError(t, handleCustomerLogin(req))
+	require.Equal(t, fasthttp.StatusBadRequest, req.RequestCtx.Response.StatusCode())
+	require.Contains(t, string(req.RequestCtx.Response.Body()), "Please complete the verification challenge.")
+}
+
+func TestHandleCustomerRegisterRequiresTurnstileToken(t *testing.T) {
+	app := testSecurityApp(t)
+	app.turnstile = turnstilesvc.New(true, "site-key", "secret-key", app.lo)
+
+	req := testFastRequest(app, fasthttp.MethodPost, "application/json")
+	req.RequestCtx.Request.SetBodyString(`{"first_name":"User","email":"user@example.com","password":"StrongPass!123","confirm_password":"StrongPass!123"}`)
+	req.RequestCtx.Request.Header.SetCookie("csrf_token", "same-token")
+	req.RequestCtx.Request.Header.Set("X-CSRFTOKEN", "same-token")
+
+	require.NoError(t, handleCustomerRegister(req))
 	require.Equal(t, fasthttp.StatusBadRequest, req.RequestCtx.Response.StatusCode())
 	require.Contains(t, string(req.RequestCtx.Response.Body()), "Please complete the verification challenge.")
 }

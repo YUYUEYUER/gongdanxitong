@@ -4,23 +4,19 @@
       <CardContent class="space-y-5 p-6">
         <div class="space-y-1 text-center">
           <CardTitle class="text-2xl font-bold text-foreground">客户注册</CardTitle>
-          <p class="text-sm text-muted-foreground">先验证邮箱，再由邮箱持有人设置登录密码。</p>
+          <p class="text-sm text-muted-foreground">填写资料并设置密码，完成验证后即可进入工单中心。</p>
         </div>
 
-        <div v-if="verificationSent" class="space-y-4 text-center" role="status">
-          <div class="rounded border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
-            验证邮件已发送。打开邮件中的链接并设置密码后，账号才会启用。
-          </div>
-          <p class="text-sm text-muted-foreground">
-            没有收到邮件时，请检查垃圾邮件目录，或稍后重新提交注册。
-          </p>
-        </div>
-
-        <form v-else class="space-y-3" @submit.prevent="registerAction">
+        <form class="space-y-3" @submit.prevent="registerAction">
           <div class="grid gap-3 sm:grid-cols-2">
             <div class="space-y-2">
               <Label for="customer-first-name" class="text-muted-foreground">称呼</Label>
-              <Input id="customer-first-name" v-model.trim="form.first_name" autocomplete="given-name" />
+              <Input
+                id="customer-first-name"
+                v-model.trim="form.first_name"
+                autocomplete="given-name"
+                required
+              />
             </div>
             <div class="space-y-2">
               <Label for="customer-last-name" class="text-muted-foreground">姓氏</Label>
@@ -35,6 +31,31 @@
               v-model.trim="form.email"
               type="email"
               autocomplete="email"
+              required
+            />
+          </div>
+
+          <div class="space-y-2">
+            <Label for="customer-register-password" class="text-muted-foreground">设置密码</Label>
+            <Input
+              id="customer-register-password"
+              v-model="form.password"
+              type="password"
+              autocomplete="new-password"
+              required
+            />
+            <p class="text-xs text-muted-foreground">
+              10 至 72 个字符，需包含大写字母、小写字母、数字和特殊字符。
+            </p>
+          </div>
+
+          <div class="space-y-2">
+            <Label for="customer-register-confirm" class="text-muted-foreground">确认密码</Label>
+            <Input
+              id="customer-register-confirm"
+              v-model="form.confirm_password"
+              type="password"
+              autocomplete="new-password"
               required
             />
           </div>
@@ -57,7 +78,7 @@
             :disabled="isLoading || (turnstileEnabled && !turnstileVerified)"
             type="submit"
           >
-            {{ isLoading ? '发送中...' : '发送验证邮件' }}
+            {{ isLoading ? '注册中...' : '注册' }}
           </Button>
         </form>
 
@@ -78,11 +99,13 @@
 
 <script setup>
 import { computed, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import api from '@/api'
 import TurnstileField from '@/components/TurnstileField.vue'
 import { useAppSettingsStore } from '@/stores/appSettings'
+import { useCustomerPortalStore } from '@/stores/customerPortal'
 import AuthLayout from '@/layouts/auth/AuthLayout.vue'
 import { Button } from '@shared-ui/components/ui/button'
 import { Error } from '@shared-ui/components/ui/error'
@@ -91,15 +114,16 @@ import { Input } from '@shared-ui/components/ui/input'
 import { Label } from '@shared-ui/components/ui/label'
 
 const { t } = useI18n()
+const router = useRouter()
 const appSettingsStore = useAppSettingsStore()
+const store = useCustomerPortalStore()
 const turnstileRef = ref(null)
 const turnstileToken = ref('')
 const turnstileVerified = ref(false)
 const turnstileError = ref('')
-const form = ref({ first_name: '', last_name: '', email: '' })
+const form = ref({ first_name: '', last_name: '', email: '', password: '', confirm_password: '' })
 const isLoading = ref(false)
 const submitError = ref('')
-const verificationSent = ref(false)
 const turnstileEnabled = computed(() => !!appSettingsStore.public_config?.['app.turnstile_enabled'])
 const turnstileSiteKey = computed(
   () => appSettingsStore.public_config?.['app.turnstile_site_key'] || ''
@@ -125,6 +149,10 @@ function handleTurnstileExpired() {
 async function registerAction() {
   if (isLoading.value) return
   submitError.value = ''
+  if (form.value.password !== form.value.confirm_password) {
+    submitError.value = '两次输入的密码不一致。'
+    return
+  }
   if (turnstileEnabled.value && !turnstileVerified.value) {
     turnstileError.value = t('auth.turnstileRequired')
     return
@@ -132,11 +160,14 @@ async function registerAction() {
 
   isLoading.value = true
   try {
-    await api.customerRegister({
+    const response = await api.customerRegister({
       ...form.value,
       'cf-turnstile-response': turnstileToken.value
     })
-    verificationSent.value = true
+    store.setCustomer(response?.data?.data || null)
+    form.value.password = ''
+    form.value.confirm_password = ''
+    await router.replace('/portal/tickets')
   } catch (error) {
     submitError.value = handleHTTPError(error).message
     turnstileVerified.value = false

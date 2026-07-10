@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/abhinavxd/libredesk/internal/dbutil"
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
 	"github.com/abhinavxd/libredesk/internal/user/models"
@@ -48,6 +49,68 @@ type portalUserState struct {
 	Type             string `db:"type"`
 	Enabled          bool   `db:"enabled"`
 	PortalRegistered bool   `db:"portal_registered"`
+}
+
+// RegisterCustomerPortal creates a new portal identity without claiming an
+// existing contact or visitor record. Mailbox ownership is not verified in
+// this flow, so attaching historical customer data would be unsafe.
+func (u *Manager) RegisterCustomerPortal(firstName, lastName, email, password string) (models.User, error) {
+	email = strings.TrimSpace(strings.ToLower(email))
+	firstName = strings.TrimSpace(firstName)
+	lastName = strings.TrimSpace(lastName)
+	if email == "" || firstName == "" || !IsStrongPassword(password) {
+		return models.User{}, envelope.NewError(envelope.InputError, u.i18n.T("globals.messages.badRequest"), nil)
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		u.lo.Error("error hashing customer portal password", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	tx, err := u.db.Beginx()
+	if err != nil {
+		u.lo.Error("error beginning customer registration transaction", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	defer tx.Rollback()
+
+	var existing portalUserState
+	err = tx.Stmtx(u.q.GetPortalUserForUpdate).Get(&existing, email)
+	switch {
+	case err == nil:
+		return models.User{}, envelope.NewError(envelope.InputError, u.i18n.T("user.sameEmailAlreadyExists"), nil)
+	case !errors.Is(err, sql.ErrNoRows):
+		u.lo.Error("error checking customer portal account", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	var userID int
+	if err := tx.Stmtx(u.q.InsertPortalUser).Get(
+		&userID,
+		email,
+		firstName,
+		lastName,
+		string(passwordHash),
+	); err != nil {
+		if dbutil.IsUniqueViolationError(err) {
+			return models.User{}, envelope.NewError(envelope.InputError, u.i18n.T("user.sameEmailAlreadyExists"), nil)
+		}
+		u.lo.Error("error creating customer portal account", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	if _, err := tx.Stmtx(u.q.DeleteCustomerRegistrationByEmail).Exec(email); err != nil {
+		u.lo.Error("error clearing legacy customer registration", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	if err := tx.Commit(); err != nil {
+		u.lo.Error("error committing customer registration", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	return u.Get(userID, "", []string{models.UserTypeContact})
 }
 
 // BeginCustomerPortalRegistration records a short-lived registration request.
