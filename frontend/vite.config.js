@@ -23,6 +23,12 @@ export default defineConfig(({ mode, command }) => {
 
   return {
     base: isWidget && command === 'build' ? '/widget/' : '/',
+    define: {
+      // Locale messages are fetched at runtime. JIT mode interprets their AST
+      // without Function/eval, so the production CSP can keep unsafe-eval off.
+      __INTLIFY_JIT_COMPILATION__: true,
+      __INTLIFY_DROP_MESSAGE_COMPILER__: false,
+    },
     css: {
       preprocessorOptions: {
         scss: {
