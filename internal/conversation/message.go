@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -22,6 +21,7 @@ import (
 	"github.com/abhinavxd/libredesk/internal/image"
 	"github.com/abhinavxd/libredesk/internal/inbox"
 	"github.com/abhinavxd/libredesk/internal/inbox/channel/livechat"
+	mediamanager "github.com/abhinavxd/libredesk/internal/media"
 	mmodels "github.com/abhinavxd/libredesk/internal/media/models"
 	"github.com/abhinavxd/libredesk/internal/sla"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
@@ -384,7 +384,7 @@ func (m *Manager) GetMessage(uuid string) (models.Message, error) {
 
 	// Generate signed URLs for attachments.
 	for i := range message.Attachments {
-		message.Attachments[i].URL = m.mediaStore.GetSignedURL(message.Attachments[i].UUID)
+		m.mediaStore.DecorateAttachment(&message.Attachments[i])
 	}
 
 	return message, nil
@@ -637,7 +637,11 @@ func (m *Manager) InsertMessage(message *models.Message) error {
 	}
 
 	// Trigger webhook for new message created.
-	m.webhookStore.TriggerEvent(wmodels.EventMessageCreated, message)
+	webhookMessage := *message
+	if webhookMessage.HasCSAT() {
+		webhookMessage.StripCSATUUID()
+	}
+	m.webhookStore.TriggerEvent(wmodels.EventMessageCreated, &webhookMessage)
 
 	return nil
 }
@@ -1151,8 +1155,22 @@ func (m *Manager) uploadMessageAttachments(message *models.Message) error {
 
 		m.lo.Debug("uploading message attachment", "name", attachment.Name, "content_id", contentID, "size", attachment.Size, "content_type", attachment.ContentType, "disposition", attachment.Disposition)
 
+		isImageAttachment, imageValidationErr := validateIncomingImageAttachment(attachment.Content)
+		if imageValidationErr != nil {
+			m.lo.Warn("skipping unsafe image attachment", "name", attachment.Name, "content_id", contentID, "error", imageValidationErr)
+			continue
+		}
+		mediaMeta := []byte("{}")
+		if isImageAttachment {
+			mediaMeta = []byte(fmt.Sprintf(`{"thumbnail_size":%d}`, image.ThumbnailStorageReserveBytes))
+		}
+
 		// Upload and insert entry in media table.
 		attachReader := bytes.NewReader(attachment.Content)
+		if message.SenderID <= 0 {
+			return fmt.Errorf("attachment sender is required for storage ownership")
+		}
+		ownerUserID := null.IntFrom(message.SenderID)
 		media, err := m.mediaStore.UploadAndInsert(
 			attachment.Name,
 			attachment.ContentType,
@@ -1160,11 +1178,11 @@ func (m *Manager) uploadMessageAttachments(message *models.Message) error {
 			/** Linking media to message happens later **/
 			null.String{}, /** modelType */
 			null.Int{},    /** modelID **/
-			null.Int{},    /** ownerUserID **/
+			ownerUserID,
 			attachReader,
 			attachment.Size,
 			null.StringFrom(attachment.Disposition),
-			[]byte("{}"), /** meta **/
+			mediaMeta,
 		)
 		if err != nil {
 			m.lo.Error("failed to upload attachment", "name", attachment.Name, "content_type", attachment.ContentType, "size", attachment.Size, "content_id", contentID, "disposition", attachment.Disposition, "conversation_uuid", message.ConversationUUID, "message_source_id", message.SourceID.String, "error", err)
@@ -1172,8 +1190,7 @@ func (m *Manager) uploadMessageAttachments(message *models.Message) error {
 		}
 
 		// If the attachment is an image, generate and upload a thumbnail. Log any errors and continue.
-		attachmentExt := strings.TrimPrefix(strings.ToLower(filepath.Ext(attachment.Name)), ".")
-		if slices.Contains(image.Exts, attachmentExt) && image.IsImageByContent(bytes.NewReader(attachment.Content)) {
+		if isImageAttachment {
 			if err := m.uploadThumbnailForMedia(media, attachment.Content); err != nil {
 				m.lo.Error("error uploading thumbnail", "error", err)
 			}
@@ -1182,6 +1199,16 @@ func (m *Manager) uploadMessageAttachments(message *models.Message) error {
 		message.Media = append(message.Media, media)
 	}
 	return nil
+}
+
+func validateIncomingImageAttachment(content []byte) (bool, error) {
+	if !image.IsImageByContent(bytes.NewReader(content)) {
+		return false, nil
+	}
+	if _, _, err := image.GetDimensions(bytes.NewReader(content)); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // findOrCreateConversation finds or creates a conversation for the given incoming message.
@@ -1295,15 +1322,16 @@ func (m *Manager) fetchMessageAttachments(messageID int) (attachment.Attachments
 		}
 
 		attachment := attachment.Attachment{
-			Name:        media.Filename,
-			UUID:        media.UUID,
-			ContentType: media.ContentType,
-			ContentID:   contentID,
-			Content:     blob,
-			Size:        media.Size,
-			Header:      attachment.MakeHeader(media.ContentType, contentID, media.Filename, "base64", media.Disposition.String),
-			URL:         m.mediaStore.GetSignedURL(media.UUID),
+			Name:               media.Filename,
+			UUID:               media.UUID,
+			ContentType:        media.ContentType,
+			ContentID:          contentID,
+			Content:            blob,
+			Size:               media.Size,
+			Header:             attachment.MakeHeader(media.ContentType, contentID, media.Filename, "base64", media.Disposition.String),
+			ThumbnailAvailable: mediamanager.ThumbnailAvailable(media.Meta, media.ContentType),
 		}
+		m.mediaStore.DecorateAttachment(&attachment)
 		attachments = append(attachments, attachment)
 	}
 
@@ -1337,7 +1365,16 @@ func (m *Manager) getOutgoingProcessingMessageIDs() []int {
 }
 
 // uploadThumbnailForMedia prepares and uploads a thumbnail for an image attachment.
-func (m *Manager) uploadThumbnailForMedia(media mmodels.Media, content []byte) error {
+func (m *Manager) uploadThumbnailForMedia(media mmodels.Media, content []byte) (returnErr error) {
+	thumbnailSize := int64(0)
+	defer func() {
+		if err := m.mediaStore.SetThumbnailSize(media.ID, thumbnailSize); err != nil {
+			m.lo.Error("error updating thumbnail accounting", "media_id", media.ID, "error", err)
+			if returnErr == nil {
+				returnErr = err
+			}
+		}
+	}()
 	// Create a reader from the content
 	file := bytes.NewReader(content)
 
@@ -1349,6 +1386,9 @@ func (m *Manager) uploadThumbnailForMedia(media mmodels.Media, content []byte) e
 	if err != nil {
 		return fmt.Errorf("error creating thumbnail: %w", err)
 	}
+	if thumbFile.Size() > image.ThumbnailStorageReserveBytes {
+		return fmt.Errorf("thumbnail exceeds storage reservation")
+	}
 
 	// Generate thumbnail name
 	thumbName := fmt.Sprintf("thumb_%s", media.UUID)
@@ -1358,6 +1398,7 @@ func (m *Manager) uploadThumbnailForMedia(media mmodels.Media, content []byte) e
 		m.lo.Error("error uploading thumbnail", "error", err)
 		return fmt.Errorf("error uploading thumbnail: %w", err)
 	}
+	thumbnailSize = thumbFile.Size()
 	return nil
 }
 

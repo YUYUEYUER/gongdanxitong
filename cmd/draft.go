@@ -26,6 +26,9 @@ func handleUpsertConversationDraft(r *fastglue.Request) error {
 		uuid  = r.RequestCtx.UserValue("uuid").(string)
 		req   = draftReq{}
 	)
+	if err := validateAgentWriteBodySize(r.RequestCtx.PostBody(), app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	user, err := app.user.GetAgentCachedOrLoad(auser.ID)
 	if err != nil {
@@ -50,13 +53,16 @@ func handleUpsertConversationDraft(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
 	}
 
-	if len(req.Meta) > maxMetaSize {
+	if len(req.Content) > maxAgentMessageBytes || len(req.Meta) > maxMetaSize {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.InputError)
 	}
 
 	// Validate content is not empty
 	if strings.TrimSpace(req.Content) == "" && (len(req.Meta) == 0 || string(req.Meta) == "{}") {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.InputError)
+	}
+	if err := checkAgentWriteRateLimit(app, user.ID); err != nil {
+		return sendErrorEnvelope(r, err)
 	}
 
 	draft, err := app.conversation.UpsertConversationDraft(conv.ID, user.ID, req.Type, req.Content, req.Meta)

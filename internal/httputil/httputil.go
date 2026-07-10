@@ -22,14 +22,14 @@ func IsOriginTrusted(origin string, trustedDomains []string) bool {
 		return false
 	}
 
-	originHost, originPort := parseHostPort(origin)
+	originHost, originPort := parseOriginHostPort(origin)
 	if originHost == "" {
 		return false
 	}
 
 	for _, trusted := range trustedDomains {
 		trustedHost, trustedPort := parseTrustedDomain(trusted)
-		if portMatches(originPort, trustedPort) && hostMatches(originHost, trustedHost) {
+		if trustedHost != "" && portMatches(originHost, originPort, trustedHost, trustedPort) && hostMatches(originHost, trustedHost) {
 			return true
 		}
 	}
@@ -37,62 +37,81 @@ func IsOriginTrusted(origin string, trustedDomains []string) bool {
 	return false
 }
 
-// parseHostPort extracts host and port from origin URL
-func parseHostPort(origin string) (host, port string) {
-	u, err := url.Parse(strings.ToLower(origin))
-	if err != nil {
+// parseOriginHostPort extracts a canonical host and effective port from an
+// HTTP Origin value. Non-TLS origins are accepted only for loopback
+// development hosts.
+func parseOriginHostPort(origin string) (host, port string) {
+	u, err := url.Parse(strings.TrimSpace(strings.ToLower(origin)))
+	if err != nil || u.User != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return "", ""
 	}
-
-	host, port, _ = net.SplitHostPort(u.Host)
-	if host == "" {
-		host = u.Host
+	host = strings.TrimSuffix(u.Hostname(), ".")
+	if host == "" || (u.Scheme != "https" && !isLoopbackHost(host)) {
+		return "", ""
+	}
+	port = u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
 	}
 	return host, port
 }
 
 // parseTrustedDomain extracts host and port from trusted domain entry
 func parseTrustedDomain(domain string) (host, port string) {
-	domain = strings.ToLower(domain)
+	domain = strings.TrimSpace(strings.ToLower(domain))
 
 	if strings.HasPrefix(domain, "http://") || strings.HasPrefix(domain, "https://") {
 		u, err := url.Parse(domain)
 		if err != nil {
 			return "", ""
 		}
-		host, port, _ = net.SplitHostPort(u.Host)
-		if host == "" {
-			host = u.Host
-		}
+		host = strings.TrimSuffix(u.Hostname(), ".")
+		port = u.Port()
 		return host, port
 	}
 
 	// Handle non-URL patterns (wildcards/domains)
-	host, port, _ = net.SplitHostPort(domain)
-	if host == "" {
+	if strings.ContainsAny(domain, "/?#@ \\") {
+		return "", ""
+	}
+	if splitHost, splitPort, err := net.SplitHostPort(domain); err == nil {
+		host, port = splitHost, splitPort
+	} else {
 		host = domain
 	}
+	host = strings.TrimSuffix(host, ".")
 	return host, port
 }
 
 // portMatches checks if ports are compatible
-func portMatches(originPort, trustedPort string) bool {
-	if trustedPort == "" || trustedPort == originPort {
+func portMatches(originHost, originPort, trustedHost, trustedPort string) bool {
+	if trustedPort != "" {
+		return trustedPort == originPort
+	}
+	if isLoopbackHost(originHost) && isLoopbackHost(strings.TrimPrefix(trustedHost, "*.")) {
 		return true
 	}
-	return false
+	return originPort == "443"
 }
 
 // hostMatches checks if host matches trusted pattern
 func hostMatches(origin, trusted string) bool {
-	if trusted == origin {
-		return true
-	}
-
 	if strings.HasPrefix(trusted, "*.") {
 		base := trusted[2:]
-		return origin == base || strings.HasSuffix(origin, "."+base)
+		return strings.HasSuffix(origin, "."+base)
 	}
+	return trusted == origin
+}
 
-	return false
+func isLoopbackHost(host string) bool {
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

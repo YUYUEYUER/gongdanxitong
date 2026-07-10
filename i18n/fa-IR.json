@@ -220,7 +220,7 @@
   "admin.inbox.livechat.tabs.installation": "نصب",
   "admin.inbox.livechat.tabs.messages": "پیام‌ها",
   "admin.inbox.livechat.tabs.prechat": "فرم پیش از چت",
-  "admin.inbox.livechat.trustedDomains.description": "هر دامنه را در یک خط جداگانه وارد کنید. *.example.com فقط زیردامنه‌ها را شامل می‌شود. دامنه اصلی example.com را جداگانه اضافه کنید. برای مجاز کردن هر دامنه‌ای خالی بگذارید.",
+  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only; add example.com separately. Leave empty to allow same-origin embedding only.",
   "admin.inbox.livechat.trustedDomains.list": "لیست دامنه",
   "admin.inbox.livechat.userSettings.visitors": "بازدیدکنندگان",
   "admin.inbox.livechat.websiteUrl": "آدرس وب‌سایت",

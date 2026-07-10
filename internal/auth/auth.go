@@ -3,10 +3,14 @@ package auth
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
 	"github.com/abhinavxd/libredesk/internal/user/models"
+	"github.com/abhinavxd/ssrfguard"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/knadh/go-i18n"
 	"github.com/redis/go-redis/v9"
@@ -32,6 +37,7 @@ type OIDCclaim struct {
 	Email         string `json:"email"`
 	EmailVerified bool   `json:"email_verified"`
 	Sub           string `json:"sub"`
+	Issuer        string `json:"-"`
 	Picture       string `json:"picture"`
 }
 
@@ -59,23 +65,27 @@ const defaultCookieName = "libredesk_session"
 
 // Auth is the auth service it manages OIDC authentication and sessions
 type Auth struct {
-	mu        sync.RWMutex
-	cfg       Config
-	i18n      *i18n.I18n
-	oauthCfgs map[int]oauth2.Config
-	verifiers map[int]*oidc.IDTokenVerifier
-	sess      *simplesessions.Manager
-	logger    *logf.Logger
-	rd        *redis.Client
+	mu         sync.RWMutex
+	cfg        Config
+	i18n       *i18n.I18n
+	oauthCfgs  map[int]oauth2.Config
+	verifiers  map[int]*oidc.IDTokenVerifier
+	sess       *simplesessions.Manager
+	logger     *logf.Logger
+	rd         *redis.Client
+	httpClient *http.Client
 }
+
+const maxOIDCResponseBytes = 1 << 20
 
 // New creates an Auth service with configured OIDC providers
 func New(cfg Config, i18n *i18n.I18n, rd *redis.Client, logger *logf.Logger) (*Auth, error) {
 	oauthCfgs := make(map[int]oauth2.Config)
 	verifiers := make(map[int]*oidc.IDTokenVerifier)
+	httpClient := newOIDCHTTPClient()
 
 	for _, provider := range cfg.Providers {
-		oidcProv, err := oidc.NewProvider(context.Background(), provider.ProviderURL)
+		oidcProv, err := discoverOIDCProvider(context.Background(), httpClient, provider.ProviderURL)
 		if err != nil {
 			logger.Error("error initializing oidc provider", "error", err, "provider", provider.Provider)
 			continue
@@ -106,7 +116,7 @@ func New(cfg Config, i18n *i18n.I18n, rd *redis.Client, logger *logf.Logger) (*A
 	}
 
 	sess := simplesessions.New(simplesessions.Options{
-		EnableAutoCreate: true,
+		EnableAutoCreate: false,
 		SessionIDLength:  64,
 		Cookie: simplesessions.CookieOptions{
 			Name:       cookieName,
@@ -123,22 +133,119 @@ func New(cfg Config, i18n *i18n.I18n, rd *redis.Client, logger *logf.Logger) (*A
 	sess.SetCookieHooks(simpleSessGetCookieCB, simpleSessSetCookieCB)
 
 	return &Auth{
-		cfg:       cfg,
-		i18n:      i18n,
-		oauthCfgs: oauthCfgs,
-		verifiers: verifiers,
-		sess:      sess,
-		logger:    logger,
-		rd:        rd,
+		cfg:        cfg,
+		i18n:       i18n,
+		oauthCfgs:  oauthCfgs,
+		verifiers:  verifiers,
+		sess:       sess,
+		logger:     logger,
+		rd:         rd,
+		httpClient: httpClient,
 	}, nil
+}
+
+type limitedOIDCTransport struct {
+	base http.RoundTripper
+}
+
+func (t limitedOIDCTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := validateOIDCOutboundURL(req.URL); err != nil {
+		return nil, err
+	}
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = http.MaxBytesReader(nil, resp.Body, maxOIDCResponseBytes)
+	return resp, nil
+}
+
+func validateOIDCOutboundURL(parsed *url.URL) error {
+	if parsed == nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+		return errors.New("OIDC endpoints must use HTTPS without user info")
+	}
+	return nil
+}
+
+func newOIDCHTTPClient() *http.Client {
+	guard := ssrfguard.New()
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   guard.Control,
+		}).DialContext,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:   3 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: limitedOIDCTransport{base: transport},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("too many OIDC discovery redirects")
+			}
+			return validateOIDCProviderURL(req.URL.String())
+		},
+	}
+}
+
+func validateOIDCProviderURL(raw string) error {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("invalid OIDC provider URL: %w", err)
+	}
+	if parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("OIDC provider URL must be an HTTPS URL without user info, query, or fragment")
+	}
+	return nil
+}
+
+func discoverOIDCProvider(ctx context.Context, client *http.Client, providerURL string) (*oidc.Provider, error) {
+	providerURL = strings.TrimSpace(providerURL)
+	if err := validateOIDCProviderURL(providerURL); err != nil {
+		return nil, err
+	}
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, client), providerURL)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := provider.Endpoint()
+	var metadata struct {
+		JWKSURL string `json:"jwks_uri"`
+	}
+	if err := provider.Claims(&metadata); err != nil {
+		return nil, fmt.Errorf("reading OIDC provider metadata: %w", err)
+	}
+	for _, raw := range []string{endpoint.AuthURL, endpoint.TokenURL, metadata.JWKSURL} {
+		parsed, parseErr := url.Parse(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid OIDC endpoint: %w", parseErr)
+		}
+		if err := validateOIDCOutboundURL(parsed); err != nil {
+			return nil, err
+		}
+	}
+	return provider, nil
+}
+
+func (a *Auth) oidcClient() *http.Client {
+	if a.httpClient != nil {
+		return a.httpClient
+	}
+	return newOIDCHTTPClient()
 }
 
 // TestProvider tests the OIDC provider url by doing a discovery on it.
 func (a *Auth) TestProvider(url string) error {
-	_, err := oidc.NewProvider(context.Background(), url)
+	_, err := discoverOIDCProvider(context.Background(), a.oidcClient(), url)
 	if err != nil {
 		a.logger.Error("error testing oidc provider", "provider_url", url, "error", err)
-		return envelope.NewError(envelope.GeneralError, err.Error(), nil)
+		return envelope.NewError(envelope.InputError, a.i18n.T("globals.messages.badRequest"), nil)
 	}
 	return nil
 }
@@ -152,7 +259,7 @@ func (a *Auth) Reload(cfg Config) error {
 	verifiers := make(map[int]*oidc.IDTokenVerifier)
 
 	for _, provider := range cfg.Providers {
-		oidcProv, err := oidc.NewProvider(context.Background(), provider.ProviderURL)
+		oidcProv, err := discoverOIDCProvider(context.Background(), a.oidcClient(), provider.ProviderURL)
 		if err != nil {
 			a.logger.Error("error initializing oidc provider", "provider", provider.Provider, "provider_url", provider.ProviderURL, "error", err)
 			return envelope.NewError(envelope.GeneralError, err.Error(), nil)
@@ -181,6 +288,23 @@ func (a *Auth) Reload(cfg Config) error {
 	return nil
 }
 
+// RemoveProvider immediately revokes a provider from the in-memory login map.
+// It is used before a full discovery reload so a transient failure in another
+// provider cannot keep a deleted identity provider active.
+func (a *Auth) RemoveProvider(providerID int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.oauthCfgs, providerID)
+	delete(a.verifiers, providerID)
+	providers := a.cfg.Providers[:0]
+	for _, provider := range a.cfg.Providers {
+		if provider.ID != providerID {
+			providers = append(providers, provider)
+		}
+	}
+	a.cfg.Providers = providers
+}
+
 // LoginURL returns the login URL for the given provider.
 func (a *Auth) LoginURL(providerID int, state string) (string, error) {
 	a.mu.RLock()
@@ -207,6 +331,7 @@ func (a *Auth) ExchangeOIDCToken(ctx context.Context, providerID int, code strin
 		return "", OIDCclaim{}, fmt.Errorf("invalid provider ID: %d", providerID)
 	}
 
+	ctx = oidc.ClientContext(ctx, a.oidcClient())
 	tk, err := oauthCfg.Exchange(ctx, code)
 	if err != nil {
 		return "", OIDCclaim{}, fmt.Errorf("error exchanging token: %v", err)
@@ -228,7 +353,26 @@ func (a *Auth) ExchangeOIDCToken(ctx context.Context, providerID int, code strin
 	if err := idTk.Claims(&claims); err != nil {
 		return "", OIDCclaim{}, errors.New("error getting user from OIDC")
 	}
+	claims.Email = strings.TrimSpace(strings.ToLower(claims.Email))
+	claims.Issuer = idTk.Issuer
+	if claims.Sub == "" {
+		claims.Sub = idTk.Subject
+	}
+	if err := ValidateOIDCClaims(claims); err != nil {
+		return "", OIDCclaim{}, err
+	}
 	return rawIDTk, claims, nil
+}
+
+// ValidateOIDCClaims enforces the identity claims required for account linking.
+func ValidateOIDCClaims(claims OIDCclaim) error {
+	if !claims.EmailVerified {
+		return errors.New("OIDC email is not verified")
+	}
+	if strings.TrimSpace(claims.Email) == "" || strings.TrimSpace(claims.Issuer) == "" || strings.TrimSpace(claims.Sub) == "" {
+		return errors.New("OIDC identity claims are incomplete")
+	}
+	return nil
 }
 
 // SaveSession creates and sets a session (post successful login/auth).
@@ -243,11 +387,12 @@ func (a *Auth) SaveSession(user amodels.User, r *fastglue.Request) error {
 	}
 
 	if err := sess.SetMulti(map[string]interface{}{
-		"id":         user.ID,
-		"email":      user.Email,
-		"first_name": user.FirstName,
-		"last_name":  user.LastName,
-		"type":       user.Type,
+		"id":              user.ID,
+		"email":           user.Email,
+		"first_name":      user.FirstName,
+		"last_name":       user.LastName,
+		"type":            user.Type,
+		"session_version": user.SessionVersion,
 	}); err != nil {
 		a.logger.Error("error setting login session", "error", err)
 		return err
@@ -260,9 +405,11 @@ func (a *Auth) SetSessionValues(r *fastglue.Request, values map[string]interface
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	sess, err := a.sess.Acquire(r.RequestCtx, r, r)
+	// OIDC pre-auth state gets a fresh session to avoid fixation and to keep
+	// anonymous page views from allocating Redis sessions.
+	sess, err := a.sess.NewSession(r, r)
 	if err != nil {
-		a.logger.Error("error acquiring session", "error", err)
+		a.logger.Error("error creating pre-auth session", "error", err)
 		return err
 	}
 
@@ -327,26 +474,28 @@ func (a *Auth) ValidateSession(r *fastglue.Request) (models.User, error) {
 		return models.User{}, err
 	}
 
-	sessVals, err := sess.GetMulti("id", "email", "first_name", "last_name", "type")
+	sessVals, err := sess.GetMulti("id", "email", "first_name", "last_name", "type", "session_version")
 	if err != nil {
 		a.logger.Error("error fetching session variables", "error", err)
 		return models.User{}, err
 	}
 
 	var (
-		userID, _    = sess.Int(sessVals["id"], nil)
-		email, _     = sess.String(sessVals["email"], nil)
-		firstName, _ = sess.String(sessVals["first_name"], nil)
-		lastName, _  = sess.String(sessVals["last_name"], nil)
-		userType, _  = sess.String(sessVals["type"], nil)
+		userID, _         = sess.Int(sessVals["id"], nil)
+		email, _          = sess.String(sessVals["email"], nil)
+		firstName, _      = sess.String(sessVals["first_name"], nil)
+		lastName, _       = sess.String(sessVals["last_name"], nil)
+		userType, _       = sess.String(sessVals["type"], nil)
+		sessionVersion, _ = sess.Int64(sessVals["session_version"], nil)
 	)
 
 	return models.User{
-		ID:        userID,
-		Email:     null.NewString(email, email != ""),
-		FirstName: firstName,
-		LastName:  lastName,
-		Type:      userType,
+		ID:             userID,
+		Email:          null.NewString(email, email != ""),
+		FirstName:      firstName,
+		LastName:       lastName,
+		Type:           userType,
+		SessionVersion: sessionVersion,
 	}, nil
 }
 

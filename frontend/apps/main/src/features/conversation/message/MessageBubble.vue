@@ -100,7 +100,7 @@
                 {{ sanitizedContent }}
               </div>
               <div v-else ref="messageContentEl" @click="onMessageContentClick">
-                <Letter
+                <SecureLetter
                   :html="sanitizedContent"
                   :allowedSchemas="['cid', 'https', 'http', 'mailto']"
                   :allowed-css-properties="extendedCssProperties"
@@ -260,7 +260,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@shared-ui/components/u
 import { Spinner } from '@shared-ui/components/ui/spinner'
 import { formatMessageTimestamp, formatFullTimestamp } from '@shared-ui/utils/datetime.js'
 import { Avatar, AvatarFallback, AvatarImage } from '@shared-ui/components/ui/avatar'
-import { Letter } from 'vue-letter'
+import SecureLetter from '@shared-ui/components/SecureLetter.vue'
 import { allowedCssProperties } from 'lettersanitizer'
 import ImageLightbox from '@/components/ImageLightbox.vue'
 import BubbleAttachmentPreview from '@main/features/conversation/message/attachment/BubbleAttachmentPreview.vue'

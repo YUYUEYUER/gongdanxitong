@@ -109,6 +109,7 @@ import { Label } from '@shared-ui/components/ui/label'
 import { Textarea } from '@shared-ui/components/ui/textarea'
 import { Paperclip, X } from 'lucide-vue-next'
 import api from '@/api'
+import { isSafePreviewImage } from '@shared-ui/utils/file.js'
 
 const router = useRouter()
 const fileInput = ref(null)
@@ -144,7 +145,7 @@ function removeAttachment(id) {
 }
 
 function isImageFile(file) {
-  return file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name)
+  return isSafePreviewImage(file)
 }
 
 function handleFileChange(event) {

@@ -8,7 +8,6 @@ import (
 
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	turnstilesvc "github.com/abhinavxd/libredesk/internal/turnstile"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/zerodha/fastglue"
 )
 
@@ -21,7 +20,7 @@ func validateTurnstileToken(r *fastglue.Request, token string, opts ...turnstile
 	ctx, cancel := context.WithTimeout(app.ctx, turnstileVerifyTimeout())
 	defer cancel()
 
-	if err := app.turnstile.Verify(ctx, token, realip.FromRequest(r.RequestCtx), opts...); err != nil {
+	if err := app.turnstile.Verify(ctx, token, app.rateLimit.ClientIP(r.RequestCtx), opts...); err != nil {
 		if errors.Is(err, turnstilesvc.ErrTokenMissing) {
 			return envelope.NewError(envelope.InputError, app.i18n.T("auth.turnstileRequired"), nil)
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,11 @@ const (
 	publicTicketMaxSubjectLength = 255
 	publicTicketMaxContentLength = 10000
 	publicTicketMaxOrderNoLength = 128
+)
+
+var (
+	publicTicketCaptchaTokenPattern  = regexp.MustCompile(`^[A-Za-z0-9]{32}$`)
+	publicTicketCaptchaAnswerPattern = regexp.MustCompile(`^[0-9]{1,2}$`)
 )
 
 type publicTicketInboxOption struct {
@@ -371,9 +377,14 @@ func publicTicketMessageContent(content, orderNumber string, app *App) string {
 }
 
 func validatePublicTicketCaptcha(app *App, token, answer string) error {
+	if !publicTicketCaptchaTokenPattern.MatchString(token) || !publicTicketCaptchaAnswerPattern.MatchString(answer) {
+		return envelope.NewError(envelope.InputError, app.i18n.T("publicTicket.captchaInvalid"), nil)
+	}
 	key := publicTicketCaptchaKeyPrefix + token
 
-	expected, err := app.redis.Get(app.ctx, key).Result()
+	// GETDEL makes the challenge single-use even when concurrent submissions
+	// race with the same solved token.
+	expected, err := app.redis.GetDel(app.ctx, key).Result()
 	if err != nil {
 		if err == redis.Nil {
 			return envelope.NewError(envelope.InputError, app.i18n.T("publicTicket.captchaExpired"), nil)
@@ -381,8 +392,6 @@ func validatePublicTicketCaptcha(app *App, token, answer string) error {
 		app.lo.Error("error fetching public ticket captcha", "error", err)
 		return envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
-
-	_ = app.redis.Del(app.ctx, key).Err()
 
 	if strings.TrimSpace(strings.ToLower(answer)) != strings.TrimSpace(strings.ToLower(expected)) {
 		return envelope.NewError(envelope.InputError, app.i18n.T("publicTicket.captchaInvalid"), nil)

@@ -132,6 +132,7 @@ import { useConversationStore } from '@/stores/conversation'
 import { useUserStore } from '@/stores/user'
 import { useI18n } from 'vue-i18n'
 import api from '../../../api'
+import { openSafeExternalUrl } from '@shared-ui/utils/url.js'
 const conversationStore = useConversationStore()
 const emitter = useEmitter()
 const conversation = computed(() => conversationStore.current)
@@ -191,7 +192,7 @@ const openContextLink = async (app) => {
   try {
     loadingAppId.value = app.id
     const resp = await api.getContextLinkURL(app.id, uuid)
-    window.open(resp.data.data, '_blank', 'noopener,noreferrer')
+    openSafeExternalUrl(resp.data.data)
   } catch {
     // Silently ignore.
   } finally {

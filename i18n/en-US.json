@@ -243,7 +243,7 @@
   "admin.inbox.livechat.tabs.installation": "Installation",
   "admin.inbox.livechat.tabs.messages": "Messages",
   "admin.inbox.livechat.tabs.prechat": "Pre-chat form",
-  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only, add the bare domain example.com separately. Leave empty to allow any domain.",
+  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only; add example.com separately. Leave empty to allow same-origin embedding only.",
   "admin.inbox.livechat.trustedDomains.list": "Domain list",
   "admin.inbox.livechat.userSettings.visitors": "Visitors",
   "admin.inbox.livechat.websiteUrl": "Website URL",

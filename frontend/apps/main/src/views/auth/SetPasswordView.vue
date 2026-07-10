@@ -68,6 +68,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
+import { consumeSensitiveFragmentToken } from '@shared-ui/utils/url.js'
 import api from '../../api'
 import { useEmitter } from '../../composables/useEmitter'
 import { EMITTER_EVENTS } from '../../constants/emitterEvents.js'
@@ -93,7 +94,7 @@ const passwordForm = ref({
 })
 
 onMounted(() => {
-  passwordForm.value.token = route.query.token
+  passwordForm.value.token = consumeSensitiveFragmentToken(route.query.token)
   if (!passwordForm.value.token) {
     router.push({ name: 'login' })
     emitter.emit(EMITTER_EVENTS.SHOW_TOAST, {

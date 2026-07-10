@@ -19,15 +19,14 @@
 import { ref, computed } from 'vue'
 import BubbleAttachmentItem from '@/features/conversation/message/attachment/BubbleAttachmentItem.vue'
 import ImageLightbox from '@/components/ImageLightbox.vue'
+import { isSafePreviewImage } from '@shared-ui/utils/file'
 
 const props = defineProps({
   attachments: { type: Array, required: true }
 })
 
-const isImage = (attachment) => (attachment.content_type || '').startsWith('image/')
-
 const imageAttachments = computed(() =>
-  (props.attachments || []).filter(isImage)
+  (props.attachments || []).filter(isSafePreviewImage)
 )
 
 const lightboxOpen = ref(false)

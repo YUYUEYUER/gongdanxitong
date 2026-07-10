@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/abhinavxd/libredesk/internal/attachment"
 	"github.com/abhinavxd/libredesk/internal/authz"
 	authzmodels "github.com/abhinavxd/libredesk/internal/authz/models"
 	"github.com/abhinavxd/libredesk/internal/automation"
@@ -28,6 +29,7 @@ import (
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/inbox"
 	imodels "github.com/abhinavxd/libredesk/internal/inbox/models"
+	"github.com/abhinavxd/libredesk/internal/jsonutil"
 	mmodels "github.com/abhinavxd/libredesk/internal/media/models"
 	notifier "github.com/abhinavxd/libredesk/internal/notification"
 	nmodels "github.com/abhinavxd/libredesk/internal/notification/models"
@@ -155,8 +157,10 @@ type mediaStore interface {
 	GetBlob(name string) ([]byte, error)
 	GetURL(uuid, contentType, fileName string) string
 	GetSignedURL(name string) string
+	DecorateAttachment(*attachment.Attachment)
 	Attach(id int, model string, modelID int) error
 	SetContentID(id int, contentID string) error
+	SetThumbnailSize(id int, thumbnailSize int64) error
 	GetByModel(id int, model string) ([]mmodels.Media, error)
 	GetByContentIDs(contentIDs []string, conversationUUID string) ([]mmodels.Media, error)
 	ContentIDExists(contentID, conversationUUID string) (bool, string, error)
@@ -368,6 +372,9 @@ func (c *Manager) CreateConversation(contactID, inboxID int, lastMessage string,
 	if err != nil {
 		c.lo.Error("error marshalling conversation meta", "error", err)
 		return 0, "", err
+	}
+	if err := jsonutil.ValidateSafeObjectKeys(customAttributes, jsonutil.DefaultMaxObjectDepth); err != nil {
+		return 0, "", envelope.NewError(envelope.InputError, c.i18n.T("globals.messages.badRequest"), nil)
 	}
 	customAttrsJSON, err := json.Marshal(customAttributes)
 	if err != nil {
@@ -1510,6 +1517,9 @@ func (m *Manager) DeleteConversation(uuid string) error {
 
 // UpdateConversationCustomAttributes updates the custom attributes of a conversation.
 func (c *Manager) UpdateConversationCustomAttributes(uuid string, customAttributes map[string]any) error {
+	if err := jsonutil.ValidateSafeObjectKeys(customAttributes, jsonutil.DefaultMaxObjectDepth); err != nil {
+		return envelope.NewError(envelope.InputError, c.i18n.T("globals.messages.badRequest"), nil)
+	}
 	jsonb, err := json.Marshal(customAttributes)
 	if err != nil {
 		c.lo.Error("error marshalling custom attributes", "error", err)
@@ -1771,7 +1781,7 @@ func (m *Manager) BuildWidgetConversationResponse(conversation models.Conversati
 			m.SignAvatarURL(&msg.Author.AvatarURL)
 			attachments := msg.Attachments
 			for j := range attachments {
-				attachments[j].URL = m.mediaStore.GetSignedURL(attachments[j].UUID)
+				m.mediaStore.DecorateAttachment(&attachments[j])
 			}
 
 			// Strip agent email from widget responses.

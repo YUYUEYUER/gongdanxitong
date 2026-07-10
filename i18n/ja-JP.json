@@ -220,7 +220,7 @@
   "admin.inbox.livechat.tabs.installation": "インストール",
   "admin.inbox.livechat.tabs.messages": "メッセージ",
   "admin.inbox.livechat.tabs.prechat": "チャット前フォーム",
-  "admin.inbox.livechat.trustedDomains.description": "1行に1ドメイン。*.example.com はサブドメインのみに一致します。ルートドメイン example.com は別途追加してください。空欄にするとすべてのドメインが許可されます。",
+  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only; add example.com separately. Leave empty to allow same-origin embedding only.",
   "admin.inbox.livechat.trustedDomains.list": "ドメインリスト",
   "admin.inbox.livechat.userSettings.visitors": "訪問者",
   "admin.inbox.livechat.websiteUrl": "ウェブサイトURL",

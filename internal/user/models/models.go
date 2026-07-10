@@ -61,6 +61,8 @@ type User struct {
 	AvatarURL              null.String          `db:"avatar_url" json:"avatar_url"`
 	Enabled                bool                 `db:"enabled" json:"enabled"`
 	Password               null.String          `db:"password" json:"-"`
+	SessionVersion         int64                `db:"session_version" json:"-"`
+	PortalRegistered       bool                 `db:"portal_registered" json:"-"`
 	LastActiveAt           null.Time            `db:"last_active_at" json:"last_active_at"`
 	LastLoginAt            null.Time            `db:"last_login_at" json:"last_login_at"`
 	Roles                  pq.StringArray       `db:"roles" json:"roles"`

@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/abhinavxd/libredesk/internal/media"
@@ -24,7 +26,8 @@ type Opts struct {
 
 // Client implements `media.Store`
 type Client struct {
-	opts Opts
+	opts    Opts
+	writeMu sync.Mutex
 }
 
 // New initialises store for Filesystem provider.
@@ -36,31 +39,87 @@ func New(opts Opts) (media.Store, error) {
 
 // Put accepts the filename, the content type and file object itself and stores the file in disk.
 func (c *Client) Put(filename string, cType string, src io.ReadSeeker) (string, error) {
-	var out *os.File
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.putAtomic(filename, src)
+}
 
-	// Get the directory path
-	dir := getDir(c.opts.UploadPath)
-	o, err := os.OpenFile(filepath.Join(dir, filename), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0664)
+// PutWithReserve serializes the physical free-space check and write. This is
+// paired with LibreDesk's single-replica deployment contract; the volume or S3
+// provider should also enforce an independent quota.
+func (c *Client) PutWithReserve(filename, _ string, src io.ReadSeeker, minFreeBytes uint64) (string, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	size, err := src.Seek(0, io.SeekEnd)
 	if err != nil {
-		return "", fmt.Errorf("opening file for write %q: %w", filepath.Join(dir, filename), err)
+		return "", fmt.Errorf("measuring upload: %w", err)
 	}
-	out = o
-	defer out.Close()
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewinding upload: %w", err)
+	}
+	available, err := c.AvailableBytes()
+	if err != nil {
+		return "", fmt.Errorf("checking upload volume capacity: %w", err)
+	}
+	if available <= minFreeBytes || uint64(size) > available-minFreeBytes {
+		return "", fmt.Errorf("upload volume free-space reserve reached")
+	}
+	return c.putAtomic(filename, src)
+}
 
-	if n, err := io.Copy(out, src); err != nil {
-		return "", fmt.Errorf("writing file %q after %d bytes: %w", filepath.Join(dir, filename), n, err)
+func (c *Client) putAtomic(filename string, src io.Reader) (string, error) {
+
+	dir := getDir(c.opts.UploadPath)
+	out, err := os.CreateTemp(dir, ".libredesk-upload-*")
+	if err != nil {
+		return "", fmt.Errorf("creating temporary upload in %q: %w", dir, err)
 	}
+	temporaryName := out.Name()
+	committed := false
+	defer func() {
+		_ = out.Close()
+		if !committed {
+			_ = os.Remove(temporaryName)
+		}
+	}()
+	if err := out.Chmod(0664); err != nil {
+		return "", fmt.Errorf("setting temporary upload permissions: %w", err)
+	}
+	if n, err := io.Copy(out, src); err != nil {
+		return "", fmt.Errorf("writing temporary upload after %d bytes: %w", n, err)
+	}
+	if err := out.Sync(); err != nil {
+		return "", fmt.Errorf("syncing temporary upload: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return "", fmt.Errorf("closing temporary upload: %w", err)
+	}
+	if err := os.Rename(temporaryName, filepath.Join(dir, filename)); err != nil {
+		return "", fmt.Errorf("committing upload %q: %w", filepath.Join(dir, filename), err)
+	}
+	committed = true
 	return filename, nil
 }
 
 // GetURL accepts a filename and retrieves the full URL for file.
 // If a signing key is configured, returns a signed URL with expiry.
-func (c *Client) GetURL(name, _, _ string) string {
+func (c *Client) GetURL(name, disposition, _ string) string {
+	var result string
 	// If no signing key configured, return unsigned URL.
 	if c.opts.SigningKey == "" {
-		return fmt.Sprintf("%s%s/%s", c.opts.RootURL(), c.opts.UploadURI, name)
+		result = fmt.Sprintf("%s%s/%s", c.opts.RootURL(), c.opts.UploadURI, name)
+	} else {
+		result = c.signURL(name)
 	}
-	return c.signURL(name)
+	if disposition == "attachment" {
+		separator := "?"
+		if strings.Contains(result, "?") {
+			separator = "&"
+		}
+		result += separator + "download=1"
+	}
+	return result
 }
 
 // signURL generates a signed URL with expiry timestamp.

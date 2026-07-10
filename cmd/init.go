@@ -109,14 +109,40 @@ func initConfig(ko *koanf.Koanf) {
 // validateConfig logs warnings/fatals for invalid config values.
 func validateConfig(ko *koanf.Koanf) {
 	encKey := ko.MustString("app.encryption_key")
+	production := strings.EqualFold(strings.TrimSpace(ko.String("app.env")), "prod")
 
 	if len(encKey) != 32 {
 		log.Fatalf("encryption_key must be exactly 32 characters, got %d", len(encKey))
 	}
 
-	// Warn if using sample config value.
 	if encKey == sampleEncKey {
+		if production {
+			log.Fatal("refusing to start in production with the sample encryption_key; generate one with `openssl rand -hex 16`")
+		}
 		colorlog.Red("WARNING: You are using the sample encryption_key from config.sample.toml. Change it immediately. Generate a secure key with `openssl rand -hex 16`")
+	}
+
+	if production {
+		if ko.Bool("app.server.disable_secure_cookies") {
+			log.Fatal("app.server.disable_secure_cookies cannot be enabled in production")
+		}
+
+		dbPassword := strings.TrimSpace(ko.String("db.password"))
+		if dbPassword == "" || strings.EqualFold(dbPassword, "libredesk") || strings.EqualFold(dbPassword, "change-me") {
+			log.Fatal("refusing to start in production with an empty or default database password")
+		}
+
+		redisPassword := strings.TrimSpace(ko.String("redis.password"))
+		if redisURL := strings.TrimSpace(ko.String("redis.url")); redisURL != "" {
+			options, err := redis.ParseURL(redisURL)
+			if err != nil {
+				log.Fatalf("error parsing redis url: %v", err)
+			}
+			redisPassword = strings.TrimSpace(options.Password)
+		}
+		if redisPassword == "" || strings.EqualFold(redisPassword, "change-me") {
+			log.Fatal("refusing to start in production without Redis authentication")
+		}
 	}
 
 	if ko.Bool("turnstile.enabled") {
@@ -580,9 +606,12 @@ func initMedia(db *sqlx.DB, i18n *i18n.I18n, settings *setting.Manager) *media.M
 	)
 	switch s := ko.MustString("upload.provider"); s {
 	case "s3":
+		if publicURL := strings.TrimSpace(ko.String("upload.s3.public_url")); publicURL != "" {
+			colorlog.Red("WARNING: upload.s3.public_url is ignored; LibreDesk requires private, expiring S3 URLs")
+		}
 		store, err = s3.New(s3.Opt{
 			URL:        ko.String("upload.s3.url"),
-			PublicURL:  ko.String("upload.s3.public_url"),
+			PublicURL:  "",
 			AccessKey:  ko.String("upload.s3.access_key"),
 			SecretKey:  ko.String("upload.s3.secret_key"),
 			Region:     ko.String("upload.s3.region"),
@@ -623,10 +652,13 @@ func initMedia(db *sqlx.DB, i18n *i18n.I18n, settings *setting.Manager) *media.M
 	}
 
 	media, err := media.New(media.Opts{
-		Store: store,
-		Lo:    lo,
-		DB:    db,
-		I18n:  i18n,
+		Store:             store,
+		Lo:                lo,
+		DB:                db,
+		I18n:              i18n,
+		MaxInstanceFiles:  ko.Int64("upload.max_total_files"),
+		MaxInstanceBytes:  ko.Int64("upload.max_total_size_bytes"),
+		MinFreeStoreBytes: ko.Int64("upload.min_free_size_bytes"),
 	})
 	if err != nil {
 		log.Fatalf("error initializing media: %v", err)
@@ -875,7 +907,7 @@ func reloadAuth(app *App) error {
 	app.lo.Info("reloading auth manager")
 	providers, err := buildProviders(app.oidc)
 	if err != nil {
-		log.Fatalf("error reloading auth: %v", err)
+		return fmt.Errorf("build auth providers: %w", err)
 	}
 	if err := app.auth.Reload(auth_.Config{Providers: providers}); err != nil {
 		app.lo.Error("error reloading auth", "error", err)
@@ -1199,16 +1231,25 @@ func getLogLevel(lvl string) logf.Level {
 // Defaults are used unless overridden in config.toml under [rate_limit.<name>].
 func initRateLimit(redisClient *redis.Client) *ratelimit.Limiter {
 	limiter := ratelimit.New(redisClient)
+	if err := limiter.SetTrustedProxies(ko.Strings("app.server.trusted_proxies")); err != nil {
+		log.Fatalf("invalid app.server.trusted_proxies configuration: %v", err)
+	}
 
 	defaults := []struct {
 		Name string
 		RPM  int
 	}{
 		{"widget", 100},
+		{"widget_upload", 5},
 		{"auth", 30},
 		{"public", 100},
 		{"public_ticket_captcha", 30},
 		{"public_ticket_submit", 10},
+		{"customer", 60},
+		{"upload", 20},
+		{"agent_write", 120},
+		{"ai", 10},
+		{"ws", 30},
 	}
 
 	for _, d := range defaults {

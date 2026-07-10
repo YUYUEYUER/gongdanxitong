@@ -220,7 +220,7 @@
   "admin.inbox.livechat.tabs.installation": "Installazione",
   "admin.inbox.livechat.tabs.messages": "Messaggi",
   "admin.inbox.livechat.tabs.prechat": "Modulo pre-chat",
-  "admin.inbox.livechat.trustedDomains.description": "Un dominio per riga. *.example.com corrisponde solo ai sottodomini, aggiungi il dominio base example.com separatamente. Lascia vuoto per consentire qualsiasi dominio.",
+  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only; add example.com separately. Leave empty to allow same-origin embedding only.",
   "admin.inbox.livechat.trustedDomains.list": "Elenco domini",
   "admin.inbox.livechat.userSettings.visitors": "Visitatori",
   "admin.inbox.livechat.websiteUrl": "URL del sito web",

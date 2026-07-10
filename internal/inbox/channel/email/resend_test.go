@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	cmodels "github.com/abhinavxd/libredesk/internal/conversation/models"
@@ -41,6 +42,7 @@ func TestSendWithResendPostsEmailPayload(t *testing.T) {
 	inbox := &Email{
 		outboundProvider:     imodels.OutboundProviderResend,
 		resendCfg:            &imodels.ResendConfig{APIKey: "re_test", APIURL: server.URL},
+		resendHTTPClient:     server.Client(),
 		replyTo:              "support@example.com",
 		enablePlusAddressing: true,
 		headers:              map[string]string{"X-Custom": "yes"},
@@ -71,4 +73,29 @@ func TestSendWithResendPostsEmailPayload(t *testing.T) {
 	require.Equal(t, "<previous@example.com>", got.Headers[headerInReplyTo])
 	require.Equal(t, "<first@example.com> <previous@example.com>", got.Headers[headerReferences])
 	require.Equal(t, "abc-123", got.Headers[headerLibredeskConversationID])
+}
+
+func TestNewResendHTTPClientRequiresHTTPS(t *testing.T) {
+	if _, err := newResendHTTPClient("http://api.example.com/emails"); err == nil {
+		t.Fatal("expected HTTP URL to be rejected")
+	}
+	if _, err := newResendHTTPClient("https://api.example.com/emails"); err != nil {
+		t.Fatalf("expected public HTTPS URL to be accepted: %v", err)
+	}
+}
+
+func TestResendHTTPClientBlocksLoopbackAtDial(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("loopback request reached server")
+	}))
+	defer server.Close()
+
+	client, err := newResendHTTPClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Get(server.URL)
+	if err == nil || !strings.Contains(err.Error(), "ssrf: connection to reserved address") {
+		t.Fatalf("expected SSRF guard rejection, got %v", err)
+	}
 }

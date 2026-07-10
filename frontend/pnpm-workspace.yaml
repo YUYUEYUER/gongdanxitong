@@ -1,0 +1,8 @@
+packages:
+  - .
+
+nodeLinker: hoisted
+
+overrides:
+  linkify-it: 5.0.2
+  markdown-it: 14.3.0

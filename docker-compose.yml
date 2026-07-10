@@ -1,10 +1,11 @@
 services:
   # Libredesk app
   app:
-    image: ${LIBREDESK_IMAGE:-libredesk-local:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # Security state and OIDC runtime invalidation currently require exactly
+    # one app process. Do not scale this service horizontally.
+    # Production must use an immutable release reference such as
+    # ghcr.io/owner/image:v2.5.2@sha256:<digest>.
+    image: ${LIBREDESK_IMAGE:?Set LIBREDESK_IMAGE to a release tag pinned by sha256 digest}
     container_name: libredesk_app
     restart: unless-stopped
     ports:
@@ -15,30 +16,50 @@ services:
       # If the password is set during first docker-compose up, the system user password will be set to this value.
       # You can always set system user password later by running `docker exec -it libredesk_app ./libredesk --set-system-user-password`.
       LIBREDESK_SYSTEM_USER_PASSWORD: ${LIBREDESK_SYSTEM_USER_PASSWORD:-}
+      LIBREDESK_APP__ENV: prod
+      LIBREDESK_APP__LOG_LEVEL: info
+      LIBREDESK_APP__ENCRYPTION_KEY: ${LIBREDESK_ENCRYPTION_KEY:?Set LIBREDESK_ENCRYPTION_KEY to a random 32-character value}
+      LIBREDESK_DB__PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      LIBREDESK_REDIS__PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      LIBREDESK_UPLOAD__MAX_TOTAL_FILES: ${LIBREDESK_UPLOAD__MAX_TOTAL_FILES:-100000}
+      LIBREDESK_UPLOAD__MAX_TOTAL_SIZE_BYTES: ${LIBREDESK_UPLOAD__MAX_TOTAL_SIZE_BYTES:-53687091200}
+      LIBREDESK_UPLOAD__MIN_FREE_SIZE_BYTES: ${LIBREDESK_UPLOAD__MIN_FREE_SIZE_BYTES:-1073741824}
     networks:
-      - libredesk
+      - frontend
+      - backend
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
-      - ./uploads:/libredesk/uploads:rw 
-      - ./config.toml:/libredesk/config.toml
-    command: [sh, -c, "./libredesk --install --idempotent-install --yes --config /libredesk/config.toml && ./libredesk --upgrade --yes --config /libredesk/config.toml && ./libredesk --config /libredesk/config.toml"]
+      - libredesk-uploads:/libredesk/uploads:rw
+      - ./config.toml:/libredesk/config.toml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - sh
+      - -ec
+      - |
+        /libredesk/libredesk --install --idempotent-install --yes --config /libredesk/config.toml
+        exec /libredesk/libredesk --config /libredesk/config.toml
 
   # PostgreSQL database
   db:
-    image: postgres:17-alpine
+    image: postgres:17.10-alpine3.24@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     container_name: libredesk_db
     restart: unless-stopped
     networks:
-      - libredesk
-    ports:
-      # Only bind on the local interface. To connect to Postgres externally, change this to 0.0.0.0
-      - "127.0.0.1:5432:5432"
+      - backend
     environment:
       # Set these environment variables to configure the database, defaults to libredesk.
       POSTGRES_USER: ${POSTGRES_USER:-libredesk}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-libredesk} 
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-libredesk}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-libredesk} -d ${POSTGRES_DB:-libredesk}"]
@@ -50,20 +71,28 @@ services:
 
   # Redis
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.9-alpine3.21@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: libredesk_redis
     restart: unless-stopped
-    ports:
-      # Only bind on the local interface.
-      - "127.0.0.1:6379:6379"
     networks:
-      - libredesk
+      - backend
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     volumes:
       - redis-data:/data
 
 networks:
-  libredesk:
+  frontend:
+  backend:
+    internal: true
 
 volumes:
+  libredesk-uploads:
   postgres-data:
   redis-data:

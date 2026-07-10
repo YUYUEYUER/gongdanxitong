@@ -31,14 +31,20 @@ func (u *Manager) MonitorUserAvailability(ctx context.Context, onUsersOffline fu
 
 // GetAgent retrieves an agent by ID and caches it.
 func (u *Manager) GetAgent(id int, email string) (models.User, error) {
+	var cacheVersion agentCacheVersion
+	if id > 0 {
+		cacheVersion = u.currentAgentCacheVersion(id)
+	}
 	agent, err := u.Get(id, email, []string{models.UserTypeAgent})
 	if err != nil {
 		return models.User{}, err
 	}
 
-	u.agentCacheMu.Lock()
-	u.agentCache[agent.ID] = cachedAgent{user: agent, expiresAt: time.Now().Add(agentCacheTTL)}
-	u.agentCacheMu.Unlock()
+	// Email-based lookups deliberately skip the authorization cache because an
+	// invalidation cannot be versioned by user ID before that lookup completes.
+	if id > 0 {
+		u.cacheAgentIfCurrent(agent, cacheVersion)
+	}
 
 	return agent, nil
 }
@@ -67,6 +73,10 @@ func (u *Manager) InvalidateAgentCache(id int) {
 	u.lo.Debug("invalidating agent cache", "agent_id", id)
 	u.agentCacheMu.Lock()
 	defer u.agentCacheMu.Unlock()
+	if u.agentCacheGeneration == nil {
+		u.agentCacheGeneration = make(map[int]uint64)
+	}
+	u.agentCacheGeneration[id]++
 	delete(u.agentCache, id)
 }
 
@@ -74,7 +84,32 @@ func (u *Manager) InvalidateAgentCache(id int) {
 func (u *Manager) InvalidateAllAgentCache() {
 	u.agentCacheMu.Lock()
 	defer u.agentCacheMu.Unlock()
+	u.agentCacheEpoch++
 	u.agentCache = make(map[int]cachedAgent)
+}
+
+type agentCacheVersion struct {
+	epoch      uint64
+	generation uint64
+}
+
+func (u *Manager) currentAgentCacheVersion(id int) agentCacheVersion {
+	u.agentCacheMu.RLock()
+	defer u.agentCacheMu.RUnlock()
+	return agentCacheVersion{epoch: u.agentCacheEpoch, generation: u.agentCacheGeneration[id]}
+}
+
+func (u *Manager) cacheAgentIfCurrent(agent models.User, expected agentCacheVersion) bool {
+	u.agentCacheMu.Lock()
+	defer u.agentCacheMu.Unlock()
+	if u.agentCacheEpoch != expected.epoch || u.agentCacheGeneration[agent.ID] != expected.generation {
+		return false
+	}
+	if u.agentCache == nil {
+		u.agentCache = make(map[int]cachedAgent)
+	}
+	u.agentCache[agent.ID] = cachedAgent{user: agent, expiresAt: time.Now().Add(agentCacheTTL)}
+	return true
 }
 
 // GetAgentsCompact returns a compact list of agents with limited fields.

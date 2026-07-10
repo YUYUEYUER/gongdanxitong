@@ -50,6 +50,7 @@ import (
 	"github.com/abhinavxd/libredesk/internal/user"
 	"github.com/abhinavxd/libredesk/internal/webhook"
 	"github.com/abhinavxd/libredesk/internal/ws"
+	"github.com/jmoiron/sqlx"
 	"github.com/knadh/go-i18n"
 	"github.com/knadh/koanf/v2"
 	"github.com/knadh/stuffbin"
@@ -116,6 +117,8 @@ type App struct {
 	redis            *redis.Client
 	importer         *importer.Importer
 	wsHub            *ws.Hub
+	db               *sqlx.DB
+	oidcAuthMu       sync.RWMutex
 
 	// Global state that stores data on an available app update.
 	update *AppUpdate
@@ -297,6 +300,7 @@ func main() {
 		redis:            rdb,
 		userNotification: userNotification,
 		wsHub:            wsHub,
+		db:               db,
 	}
 	app.consts.Store(constants)
 
@@ -304,13 +308,20 @@ func main() {
 	g.SetContext(app)
 	initHandlers(g, wsHub)
 
+	readTimeout := ko.MustDuration("app.server.read_timeout")
+	maxRequestBodySize := ko.MustInt("app.server.max_body_size")
 	s := &fasthttp.Server{
-		Name:                 appName,
-		ReadTimeout:          ko.MustDuration("app.server.read_timeout"),
-		WriteTimeout:         ko.MustDuration("app.server.write_timeout"),
-		MaxRequestBodySize:   ko.MustInt("app.server.max_body_size"),
-		MaxKeepaliveDuration: ko.MustDuration("app.server.keepalive_timeout"),
-		ReadBufferSize:       ko.Int("app.server.read_buffer_size"),
+		Name:                         appName,
+		ReadTimeout:                  readTimeout,
+		WriteTimeout:                 ko.MustDuration("app.server.write_timeout"),
+		MaxRequestBodySize:           maxRequestBodySize,
+		MaxKeepaliveDuration:         ko.MustDuration("app.server.keepalive_timeout"),
+		ReadBufferSize:               ko.Int("app.server.read_buffer_size"),
+		Concurrency:                  normalizeHTTPConcurrency(ko.Int("app.server.concurrency")),
+		HeaderReceived:               requestHeaderConfig(maxRequestBodySize, readTimeout),
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+		Handler:                      enforceRequestBodyPolicy(g.Handler(), maxRequestBodySize),
 	}
 
 	go func() {

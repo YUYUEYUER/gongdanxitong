@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	amodels "github.com/abhinavxd/libredesk/internal/auth/models"
 	cmodels "github.com/abhinavxd/libredesk/internal/conversation/models"
@@ -13,7 +14,6 @@ import (
 	turnstilesvc "github.com/abhinavxd/libredesk/internal/turnstile"
 	"github.com/abhinavxd/libredesk/internal/user"
 	umodels "github.com/abhinavxd/libredesk/internal/user/models"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
@@ -22,7 +22,6 @@ type customerRegisterRequest struct {
 	FirstName           string `json:"first_name"`
 	LastName            string `json:"last_name"`
 	Email               string `json:"email"`
-	Password            string `json:"password"`
 	CFTurnstileResponse string `json:"cf-turnstile-response"`
 	TurnstileToken      string `json:"turnstile_token"`
 }
@@ -40,6 +39,11 @@ type customerForgotPasswordRequest struct {
 }
 
 type customerResetPasswordRequest struct {
+	Token    string `json:"token"`
+	Password string `json:"password"`
+}
+
+type customerVerifyEmailRequest struct {
 	Token    string `json:"token"`
 	Password string `json:"password"`
 }
@@ -77,6 +81,12 @@ type customerTicketDetailResponse struct {
 
 const customerPortalInboxName = "客户门户"
 
+const (
+	maxCustomerTicketSubjectLength = 255
+	maxCustomerTicketContentLength = 10000
+	maxCustomerTicketAttachments   = 10
+)
+
 func handleCustomerTicketConfig(r *fastglue.Request) error {
 	app := r.Context.(*App)
 
@@ -112,7 +122,7 @@ func handleCustomerRegister(r *fastglue.Request) error {
 		return sendErrorEnvelope(r, err)
 	}
 
-	ip := realip.FromRequest(r.RequestCtx)
+	ip := requestClientIP(app, r.RequestCtx)
 	userAgent := string(r.RequestCtx.UserAgent())
 	if err := checkCustomerRegisterRateLimit(r.RequestCtx, app, ip, userAgent, req); err != nil {
 		return sendErrorEnvelope(r, err)
@@ -129,19 +139,65 @@ func handleCustomerRegister(r *fastglue.Request) error {
 		return sendErrorEnvelope(r, err)
 	}
 
-	customer, err := app.user.RegisterCustomerContact(req.FirstName, req.LastName, req.Email, req.Password)
+	token, err := app.user.BeginCustomerPortalRegistration(req.FirstName, req.LastName, req.Email)
 	if err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
+	if token != "" {
+		content, renderErr := app.tmpl.RenderInMemoryTemplate(tmpl.TmplCustomerVerifyEmail, map[string]string{
+			"VerificationToken": token,
+		})
+		if renderErr != nil {
+			app.lo.Error("error rendering customer verification template", "error", renderErr)
+		} else if sendErr := app.notifier.Send(notifier.Message{
+			RecipientEmails: []string{req.Email},
+			Subject:         "Verify your customer portal email",
+			Content:         content,
+			Provider:        notifier.ProviderEmail,
+		}); sendErr != nil {
+			// Keep the public response identical for existing and new emails.
+			app.lo.Error("error sending customer verification email", "error", sendErr)
+		}
+	}
+
+	return r.SendEnvelope(map[string]bool{"verification_required": true})
+}
+
+func handleCustomerVerifyEmail(r *fastglue.Request) error {
+	app := r.Context.(*App)
+	req := customerVerifyEmailRequest{}
+
+	if err := requireJSONPost(r.RequestCtx, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := validateCSRFCookie(r, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := r.Decode(&req, "json"); err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
+	}
+	req.Token = strings.TrimSpace(req.Token)
+	if req.Token == "" {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.badRequest"), nil, envelope.InputError)
+	}
+	if !user.IsStrongPassword(req.Password) {
+		return sendErrorEnvelope(r, envelope.NewError(envelope.InputError, user.PasswordHint, nil))
+	}
+
+	customer, err := app.user.VerifyCustomerPortalRegistration(req.Token, req.Password)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 	if err := app.customerAuth.SaveSession(amodels.User{
-		ID:        customer.ID,
-		Email:     customer.Email.String,
-		FirstName: customer.FirstName,
-		LastName:  customer.LastName,
-		Type:      customer.Type,
+		ID:             customer.ID,
+		Email:          customer.Email.String,
+		FirstName:      customer.FirstName,
+		LastName:       customer.LastName,
+		Type:           customer.Type,
+		SessionVersion: customer.SessionVersion,
 	}, r); err != nil {
-		app.lo.Error("error saving customer session", "error", err)
+		app.lo.Error("error saving verified customer session", "error", err)
 		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
 	}
 	if err := app.customerAuth.SetCSRFCookie(r); err != nil {
@@ -158,6 +214,12 @@ func handleCustomerRegister(r *fastglue.Request) error {
 func handleCustomerLogin(r *fastglue.Request) error {
 	app := r.Context.(*App)
 	req := customerLoginRequest{}
+	if err := requireJSONPost(r.RequestCtx, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := validateCSRFCookie(r, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	if err := r.Decode(&req, "json"); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
@@ -166,7 +228,7 @@ func handleCustomerLogin(r *fastglue.Request) error {
 	if req.Email == "" || req.Password == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.badRequest"), nil, envelope.InputError)
 	}
-	ip := realip.FromRequest(r.RequestCtx)
+	ip := requestClientIP(app, r.RequestCtx)
 	userAgent := string(r.RequestCtx.UserAgent())
 
 	if err := validateTurnstileToken(r, req.turnstileResponse(), turnstilesvc.WithExpectedAction(turnstileActionCustomerLogin)); err != nil {
@@ -190,11 +252,12 @@ func handleCustomerLogin(r *fastglue.Request) error {
 	}
 
 	if err := app.customerAuth.SaveSession(amodels.User{
-		ID:        customer.ID,
-		Email:     customer.Email.String,
-		FirstName: customer.FirstName,
-		LastName:  customer.LastName,
-		Type:      customer.Type,
+		ID:             customer.ID,
+		Email:          customer.Email.String,
+		FirstName:      customer.FirstName,
+		LastName:       customer.LastName,
+		Type:           customer.Type,
+		SessionVersion: customer.SessionVersion,
 	}, r); err != nil {
 		app.lo.Error("error saving customer session", "error", err)
 		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
@@ -236,6 +299,12 @@ func handleGetCurrentCustomer(r *fastglue.Request) error {
 func handleCustomerForgotPassword(r *fastglue.Request) error {
 	app := r.Context.(*App)
 	req := customerForgotPasswordRequest{}
+	if err := requireJSONPost(r.RequestCtx, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := validateCSRFCookie(r, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	if err := r.Decode(&req, "json"); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
@@ -249,11 +318,8 @@ func handleCustomerForgotPassword(r *fastglue.Request) error {
 		return sendErrorEnvelope(r, err)
 	}
 
-	customer, err := app.user.GetContactByEmail(strings.TrimSpace(strings.ToLower(req.Email)))
+	customer, err := app.user.GetRegisteredPortalContactByEmail(req.Email)
 	if err != nil {
-		return r.SendEnvelope(true)
-	}
-	if !user.IsCustomerPortalRegistered(customer) {
 		return r.SendEnvelope(true)
 	}
 
@@ -262,7 +328,7 @@ func handleCustomerForgotPassword(r *fastglue.Request) error {
 		return sendErrorEnvelope(r, err)
 	}
 
-	content, err := app.tmpl.RenderInMemoryTemplate(tmpl.TmplResetPassword, map[string]string{
+	content, err := app.tmpl.RenderInMemoryTemplate(tmpl.TmplCustomerResetPassword, map[string]string{
 		"ResetToken": token,
 	})
 	if err != nil {
@@ -286,6 +352,12 @@ func handleCustomerForgotPassword(r *fastglue.Request) error {
 func handleCustomerResetPassword(r *fastglue.Request) error {
 	app := r.Context.(*App)
 	req := customerResetPasswordRequest{}
+	if err := requireJSONPost(r.RequestCtx, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := validateCSRFCookie(r, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	if err := r.Decode(&req, "json"); err != nil {
 		return sendErrorEnvelope(r, envelope.NewError(envelope.InputError, app.i18n.T("errors.parsingRequest"), nil))
@@ -294,16 +366,8 @@ func handleCustomerResetPassword(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.Ts("globals.messages.empty", "name", "{globals.terms.password}"), nil, envelope.InputError)
 	}
 
-	id, err := app.user.ResetPassword(req.Token, req.Password)
+	_, err := app.user.ResetPassword(req.Token, req.Password, umodels.UserTypeContact)
 	if err != nil {
-		return sendErrorEnvelope(r, err)
-	}
-
-	customer, err := app.user.Get(id, "", []string{umodels.UserTypeContact})
-	if err != nil {
-		return sendErrorEnvelope(r, err)
-	}
-	if err := app.user.SaveCustomAttributes(customer.ID, map[string]any{"portal_registered": true}, false); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
@@ -349,8 +413,7 @@ func handleCustomerGetTicket(r *fastglue.Request) error {
 	}
 	for i := range messages {
 		for j := range messages[i].Attachments {
-			att := messages[i].Attachments[j]
-			messages[i].Attachments[j].URL = app.media.GetURL(att.UUID, att.ContentType, att.Name)
+			app.media.DecorateAttachment(&messages[i].Attachments[j])
 		}
 	}
 	reverseMessages(messages)
@@ -378,6 +441,15 @@ func handleCustomerCreateTicket(r *fastglue.Request) error {
 	}
 	if req.Content == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("validation.messageCannotBeEmpty"), nil, envelope.InputError)
+	}
+	if utf8.RuneCountInString(req.Subject) > maxCustomerTicketSubjectLength {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Subject is too long", nil, envelope.InputError)
+	}
+	if utf8.RuneCountInString(req.Content) > maxCustomerTicketContentLength {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Message is too long", nil, envelope.InputError)
+	}
+	if len(req.Attachments) > maxCustomerTicketAttachments {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Too many attachments", nil, envelope.InputError)
 	}
 	if err := validatePublicTicketOrderNumber(req.OrderNumber, app); err != nil {
 		return sendErrorEnvelope(r, err)
@@ -448,6 +520,12 @@ func handleCustomerReplyTicket(r *fastglue.Request) error {
 	if req.Message == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("validation.messageCannotBeEmpty"), nil, envelope.InputError)
 	}
+	if utf8.RuneCountInString(req.Message) > maxCustomerTicketContentLength {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Message is too long", nil, envelope.InputError)
+	}
+	if len(req.Attachments) > maxCustomerTicketAttachments {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Too many attachments", nil, envelope.InputError)
+	}
 
 	media, err := getUnassociatedMedia(app, req.Attachments, auser.ID)
 	if err != nil {
@@ -468,8 +546,7 @@ func handleCustomerReplyTicket(r *fastglue.Request) error {
 	}
 
 	for i := range message.Attachments {
-		att := message.Attachments[i]
-		message.Attachments[i].URL = app.media.GetURL(att.UUID, att.ContentType, att.Name)
+		app.media.DecorateAttachment(&message.Attachments[i])
 	}
 
 	return r.SendEnvelope(message)

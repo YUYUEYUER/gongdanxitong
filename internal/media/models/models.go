@@ -33,6 +33,8 @@ type Media struct {
 	Meta        json.RawMessage `db:"meta" json:"meta"`
 
 	// Pseudo fields
-	URL     string `json:"url"`
-	Content []byte `json:"-"`
+	URL          string `json:"url"`
+	DownloadURL  string `json:"download_url"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+	Content      []byte `json:"-"`
 }

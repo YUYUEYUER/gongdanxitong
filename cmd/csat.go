@@ -27,6 +27,7 @@ func handleShowCSAT(r *fastglue.Request) error {
 		app  = r.Context.(*App)
 		uuid = r.RequestCtx.UserValue("uuid").(string)
 	)
+	setCSATPageSecurityHeaders(r.RequestCtx, false)
 
 	csat, err := app.csat.Get(uuid)
 	if err != nil {
@@ -57,7 +58,9 @@ func handleShowCSAT(r *fastglue.Request) error {
 
 	return app.tmpl.RenderWebPage(r.RequestCtx, "csat", map[string]interface{}{
 		"Data": map[string]interface{}{
-			"Title": app.i18n.T("csat.pageTitle"),
+			"Title":      app.i18n.T("csat.pageTitle"),
+			"Stylesheet": "/static/public/static/csat.css",
+			"Script":     "/static/public/static/csat.js",
 			"CSAT": map[string]interface{}{
 				"UUID": csat.UUID,
 			},
@@ -75,6 +78,7 @@ func handleUpdateCSATResponse(r *fastglue.Request) error {
 		app  = r.Context.(*App)
 		uuid = r.RequestCtx.UserValue("uuid").(string)
 	)
+	setCSATPageSecurityHeaders(r.RequestCtx, false)
 
 	rating, feedback, metaJSON, errKey := validateCSATForm(r)
 	if errKey != "" {
@@ -107,6 +111,7 @@ func handleShowCSATWidget(r *fastglue.Request) error {
 		app  = r.Context.(*App)
 		uuid = r.RequestCtx.UserValue("uuid").(string)
 	)
+	setCSATPageSecurityHeaders(r.RequestCtx, true)
 
 	csat, err := app.csat.Get(uuid)
 	if err != nil {

@@ -117,7 +117,7 @@
 
         <!-- Note content -->
         <CardContent :class="compact ? 'px-3 pb-3 pt-0' : 'pt-4 pb-5'">
-          <Letter
+          <SecureLetter
             :html="note.note"
             :allowedSchemas="['cid', 'https', 'http', 'mailto']"
             class="whitespace-pre-wrap text-sm native-html"
@@ -194,7 +194,7 @@ import { EMITTER_EVENTS } from '@main/constants/emitterEvents.js'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import { getInitials } from '@shared-ui/utils/string'
 import { useUserStore } from '@main/stores/user'
-import { Letter } from 'vue-letter'
+import SecureLetter from '@shared-ui/components/SecureLetter.vue'
 import api from '@main/api'
 
 const props = defineProps({ contactId: Number, compact: { type: Boolean, default: false } })

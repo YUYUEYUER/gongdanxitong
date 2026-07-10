@@ -270,6 +270,11 @@ func TestResolveAttachmentCIDs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			for i := range tt.msg.Attachments {
+				if tt.msg.Attachments[i].URL != "" && tt.msg.Attachments[i].ContentType == "" {
+					tt.msg.Attachments[i].ContentType = "image/png"
+				}
+			}
 			resolveAttachmentCIDs(&tt.msg, tt.rootURL)
 			if tt.msg.Content != tt.want {
 				t.Errorf("resolveAttachmentCIDs()\n got  = %s\n want = %s", tt.msg.Content, tt.want)

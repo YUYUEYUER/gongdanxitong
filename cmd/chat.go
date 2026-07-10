@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -24,7 +25,6 @@ import (
 	imodels "github.com/abhinavxd/libredesk/internal/inbox/models"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
 	umodels "github.com/abhinavxd/libredesk/internal/user/models"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/valyala/fasthttp"
 	"github.com/volatiletech/null/v9"
@@ -34,21 +34,28 @@ import (
 const (
 	maxChatConversationsPerContact  = 50
 	chatConversationRateLimitWindow = 24 * time.Hour
-	widgetSessionPrefix             = "widget_session:"
-	defaultSessionTTL               = 180 * 24 * time.Hour
-	minSessionTTL                   = 1 * time.Hour
-	maxChatMessageLength            = 10000
-	maxEmailLength                  = 254
-	maxNameLength                   = 128
-	maxExternalUserIDLength         = 128
+	maxWidgetJWTBytes               = 16 * 1024
+	// v2 invalidates all pre-hardening bearer tokens, including tokens that may
+	// have been exposed through the legacy parent-domain cookie.
+	widgetSessionPrefix     = "widget_session:v2:"
+	defaultSessionTTL       = 30 * 24 * time.Hour
+	minSessionTTL           = 1 * time.Hour
+	maxSessionTTL           = 30 * 24 * time.Hour
+	maxChatMessageLength    = 10000
+	maxEmailLength          = 254
+	maxNameLength           = 128
+	maxExternalUserIDLength = 128
 )
 
 // WidgetSession holds session data stored in Redis.
 type WidgetSession struct {
-	UserID         int
-	InboxID        int
-	IsVisitor      bool
-	ExternalUserID string
+	UserID              int
+	UserSessionVersion  int64
+	InboxID             int
+	InboxSessionVersion int64
+	ParentOrigin        string
+	IsVisitor           bool
+	ExternalUserID      string
 }
 
 // Claims holds JWT claims for a JWT user.
@@ -83,7 +90,7 @@ type chatInitReq struct {
 type chatSettingsResponse struct {
 	livechat.Config
 	// Hide server-side fields from the public widget response.
-	TrustedDomains         *struct{}                     `json:"trusted_domains,omitempty"`
+	TrustedDomains         []string                      `json:"trusted_domains,omitempty"`
 	BlockedIPs             *struct{}                     `json:"blocked_ips,omitempty"`
 	Continuity             *struct{}                     `json:"continuity,omitempty"`
 	SessionDuration        *struct{}                     `json:"session_duration,omitempty"`
@@ -102,7 +109,6 @@ type conversationResponseWithBusinessHours struct {
 
 // handleGetChatLauncherSettings returns the live chat launcher settings for the widget.
 func handleGetChatLauncherSettings(r *fastglue.Request) error {
-	r.RequestCtx.Response.Header.Set("Access-Control-Allow-Origin", "*")
 	config, err := getWidgetConfig(r)
 	if err != nil {
 		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, err.Error(), nil))
@@ -124,7 +130,8 @@ func handleGetChatSettings(r *fastglue.Request) error {
 	}
 
 	response := chatSettingsResponse{
-		Config: config,
+		Config:         config,
+		TrustedDomains: slices.Clone(config.TrustedDomains),
 	}
 
 	// Get business hours data if office hours feature is enabled.
@@ -174,7 +181,7 @@ func handleChatInit(r *fastglue.Request) error {
 	var (
 		app               = r.Context.(*App)
 		req               = chatInitReq{}
-		clientIP          = realip.FromRequest(r.RequestCtx)
+		clientIP          = app.rateLimit.ClientIP(r.RequestCtx)
 		userAgent         = string(r.RequestCtx.Request.Header.Peek("User-Agent"))
 		contactID         int
 		isVisitor         bool
@@ -200,6 +207,10 @@ func handleChatInit(r *fastglue.Request) error {
 		app.lo.Error("error getting inbox from middleware context", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 	}
+	parentOrigin, err := getWidgetParentOrigin(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("status.deniedPermission"), nil, envelope.PermissionError)
+	}
 
 	config, err := getWidgetConfig(r)
 	if err != nil {
@@ -217,7 +228,7 @@ func handleChatInit(r *fastglue.Request) error {
 	} else {
 		// New visitor - create visitor and session token.
 		isVisitor = true
-		visitor, newSessionToken, conversationAttrs, err = createVisitorContact(app, req.FormData, config, inbox)
+		visitor, newSessionToken, conversationAttrs, err = createVisitorContact(app, req.FormData, config, inbox, parentOrigin)
 		if err != nil {
 			app.lo.Error("error creating visitor contact", "error", err)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
@@ -303,6 +314,8 @@ func handleChatInit(r *fastglue.Request) error {
 
 	// Add session token and user metadata when a new visitor is created.
 	if newSessionToken != "" {
+		setWidgetTokenCookie(r.RequestCtx, inbox.UUID, newSessionToken, widgetSessionCookie, defaultSessionTTL)
+		setWidgetTokenCookie(r.RequestCtx, inbox.UUID, newSessionToken, widgetVisitorCookie, defaultSessionTTL)
 		response["session_token"] = newSessionToken
 		response["user"] = map[string]any{
 			"user_id":    contactID,
@@ -353,11 +366,15 @@ func handleAuthExchange(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 	}
+	parentOrigin, err := getWidgetParentOrigin(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("status.deniedPermission"), nil, envelope.PermissionError)
+	}
 
 	var req struct {
 		JWT string `json:"jwt"`
 	}
-	if err := r.Decode(&req, "json"); err != nil || req.JWT == "" {
+	if err := r.Decode(&req, "json"); err != nil || !validWidgetJWTInput(req.JWT) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.Ts("globals.messages.required", "name", "jwt"), nil, envelope.InputError)
 	}
 
@@ -390,17 +407,29 @@ func handleAuthExchange(r *fastglue.Request) error {
 
 	// Save custom attributes from JWT.
 	if len(claims.ContactCustomAttributes) > 0 {
-		if err := app.user.SaveCustomAttributes(contactID, claims.ContactCustomAttributes, false); err != nil {
-			app.lo.Error("error saving custom attributes during auth exchange", "contact_id", contactID, "error", err)
+		if err := sanitizeContactCustomAttributes(claims.ContactCustomAttributes, app); err != nil {
+			return sendErrorEnvelope(r, err)
 		}
+		if err := app.user.SaveCustomAttributes(contactID, claims.ContactCustomAttributes, false); err != nil {
+			return sendErrorEnvelope(r, err)
+		}
+	}
+	contact, err := app.user.Get(contactID, "", []string{umodels.UserTypeContact})
+	if err != nil || !contact.Enabled {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("globals.terms.unAuthorized"), nil, envelope.UnauthorizedError)
 	}
 
 	ctx := context.Background()
-	reverseKey := fmt.Sprintf("widget_user:%d:%d", inbox.ID, contactID)
+	originHash := sha256.Sum256([]byte(parentOrigin))
+	reverseKey := fmt.Sprintf("widget_user:%d:%d:%x", inbox.ID, contactID, originHash[:8])
 	sessionTTL := getSessionDuration(config)
 
 	sendSession := func(token string) error {
-		app.redis.Set(ctx, reverseKey, token, sessionTTL)
+		if err := app.redis.Set(ctx, reverseKey, token, sessionTTL).Err(); err != nil {
+			app.lo.Error("error storing widget session reverse lookup", "error", err, "contact_id", contactID, "inbox_id", inbox.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
+		}
+		setWidgetTokenCookie(r.RequestCtx, inbox.UUID, token, widgetSessionCookie, sessionTTL)
 		return r.SendEnvelope(map[string]any{
 			"session_token": token,
 			"user": map[string]any{
@@ -414,18 +443,22 @@ func handleAuthExchange(r *fastglue.Request) error {
 
 	// Reuse existing valid session and refresh its TTL.
 	if oldToken, err := app.redis.Get(ctx, reverseKey).Result(); err == nil && oldToken != "" {
-		if _, err := loadSession(app, oldToken, config); err == nil {
+		if session, err := loadSession(app, oldToken, inbox, config, parentOrigin); err == nil && session.UserSessionVersion == contact.SessionVersion {
 			return sendSession(oldToken)
 		}
 	}
 
 	// Generate new session token.
-	token, err := generateSessionToken(app, contactID, inbox.ID, false, claims.ExternalUserID, sessionTTL)
+	token, err := generateSessionToken(app, contactID, contact.SessionVersion, inbox, false, claims.ExternalUserID, parentOrigin, sessionTTL)
 	if err != nil {
 		app.lo.Error("error generating session token", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 	}
 	return sendSession(token)
+}
+
+func validWidgetJWTInput(raw string) bool {
+	return raw != "" && len(raw) <= maxWidgetJWTBytes
 }
 
 // handleWidgetAuthMe returns the current authenticated user's metadata.
@@ -442,11 +475,19 @@ func handleWidgetAuthMe(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 	}
 
+	token, err := getWidgetSessionToken(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("globals.terms.unAuthorized"), nil, envelope.UnauthorizedError)
+	}
+
 	return r.SendEnvelope(map[string]any{
-		"user_id":    u.ID,
-		"is_visitor": u.Type == umodels.UserTypeVisitor,
-		"first_name": u.FirstName,
-		"last_name":  u.LastName,
+		"session_token": token,
+		"user": map[string]any{
+			"user_id":    u.ID,
+			"is_visitor": u.Type == umodels.UserTypeVisitor,
+			"first_name": u.FirstName,
+			"last_name":  u.LastName,
+		},
 	})
 }
 
@@ -591,7 +632,7 @@ func handleWidgetMediaUpload(r *fastglue.Request) error {
 	}
 
 	files, ok := form.File["files"]
-	if !ok || len(files) == 0 {
+	if !ok || len(files) != 1 {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("validation.notFoundFile"), nil, envelope.InputError)
 	}
 
@@ -629,11 +670,29 @@ func handleWidgetMediaUpload(r *fastglue.Request) error {
 	if !slices.Contains(consts.AllowedUploadFileExtensions, "*") && !slices.Contains(consts.AllowedUploadFileExtensions, srcExt) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("media.fileTypeNotAllowed"), nil, envelope.InputError)
 	}
+	canStore, err := app.media.CanStoreForOwner(senderID, srcFileSize)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if !canStore {
+		return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, "Persistent upload quota exceeded", nil, envelope.InputError)
+	}
+	inbox, err := getWidgetInbox(r)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := checkWidgetUploadBudget(app, senderID, inbox.ID, srcFileSize); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
-	fileContent, err := io.ReadAll(file)
+	maxReadBytes := int64(consts.MaxFileUploadSizeMB) << 20
+	fileContent, err := io.ReadAll(io.LimitReader(file, maxReadBytes+1))
 	if err != nil {
 		app.lo.Error("error reading file content", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
+	}
+	if int64(len(fileContent)) > maxReadBytes {
+		return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, app.i18n.T("media.fileTypeNotAllowed"), nil, envelope.InputError)
 	}
 
 	message := cmodels.Message{
@@ -660,6 +719,10 @@ func handleWidgetMediaUpload(r *fastglue.Request) error {
 	// Process the incoming message with attachment.
 	if message, err = app.conversation.ProcessIncomingLiveChatMessage(message); err != nil {
 		app.lo.Error("error processing incoming message with attachment", "error", err)
+		var envErr envelope.Error
+		if errors.As(err, &envErr) {
+			return sendErrorEnvelope(r, envErr)
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.errorSendingMessage"), nil, envelope.GeneralError)
 	}
 
@@ -676,7 +739,7 @@ func sendChatMessageResponse(app *App, r *fastglue.Request, messageUUID string) 
 	}
 
 	for i := range message.Attachments {
-		message.Attachments[i].URL = app.media.GetSignedURL(message.Attachments[i].UUID)
+		app.media.DecorateAttachment(&message.Attachments[i])
 	}
 	app.conversation.SignAvatarURL(&message.Author.AvatarURL)
 
@@ -745,6 +808,7 @@ func saveContactAttrsAndCollectConvoAttrs(app *App, contactID int, claims *Claim
 		jwtContactAttrs = claims.ContactCustomAttributes
 	}
 	mergedContactAttrs := mergeCustomAttributes(jwtContactAttrs, formContactAttrs)
+	delete(mergedContactAttrs, "portal_registered")
 	if len(mergedContactAttrs) > 0 {
 		if err := app.user.SaveCustomAttributes(contactID, mergedContactAttrs, false); err != nil {
 			app.lo.Error("error updating contact custom attributes", "contact_id", contactID, "error", err)
@@ -794,7 +858,7 @@ func resolveOrCreateExternalContact(app *App, claims Claims) (int, error) {
 }
 
 // createVisitorContact creates a new visitor contact from form data.
-func createVisitorContact(app *App, formData map[string]any, config livechat.Config, inbox imodels.Inbox) (umodels.User, string, map[string]any, error) {
+func createVisitorContact(app *App, formData map[string]any, config livechat.Config, inbox imodels.Inbox, parentOrigin string) (umodels.User, string, map[string]any, error) {
 	// Validate form data and get final name/email for new visitor.
 	finalName, finalEmail, err := validateFormData(formData, config, nil)
 	if err != nil {
@@ -815,7 +879,7 @@ func createVisitorContact(app *App, formData map[string]any, config livechat.Con
 		return umodels.User{}, "", nil, err
 	}
 
-	token, err := generateSessionToken(app, visitor.ID, inbox.ID, true, "", defaultSessionTTL)
+	token, err := generateSessionToken(app, visitor.ID, visitor.SessionVersion, inbox, true, "", parentOrigin, defaultSessionTTL)
 	if err != nil {
 		app.lo.Error("error generating session token for visitor", "error", err)
 		return umodels.User{}, "", nil, err
@@ -939,7 +1003,11 @@ func verifyStandardJWT(jwtToken string, inboxSecret string) (Claims, error) {
 }
 
 // generateSessionToken creates a random session token and stores it in Redis.
-func generateSessionToken(app *App, userID, inboxID int, isVisitor bool, externalUserID string, ttl time.Duration) (string, error) {
+func generateSessionToken(app *App, userID int, userSessionVersion int64, inbox imodels.Inbox, isVisitor bool, externalUserID, parentOrigin string, ttl time.Duration) (string, error) {
+	canonicalOrigin, ok := canonicalWidgetOrigin(parentOrigin)
+	if userID <= 0 || userSessionVersion < 1 || inbox.ID <= 0 || inbox.Channel != livechat.ChannelLiveChat || !inbox.Enabled || inbox.WidgetSessionVersion < 1 || !ok {
+		return "", fmt.Errorf("livechat inbox is unavailable for session creation")
+	}
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generating random token: %w", err)
@@ -949,10 +1017,13 @@ func generateSessionToken(app *App, userID, inboxID int, isVisitor bool, externa
 
 	ctx := context.Background()
 	fields := map[string]any{
-		"user_id":          strconv.Itoa(userID),
-		"inbox_id":         strconv.Itoa(inboxID),
-		"is_visitor":       strconv.FormatBool(isVisitor),
-		"external_user_id": externalUserID,
+		"user_id":               strconv.Itoa(userID),
+		"user_session_version":  strconv.FormatInt(userSessionVersion, 10),
+		"inbox_id":              strconv.Itoa(inbox.ID),
+		"inbox_session_version": strconv.FormatInt(inbox.WidgetSessionVersion, 10),
+		"parent_origin":         canonicalOrigin,
+		"is_visitor":            strconv.FormatBool(isVisitor),
+		"external_user_id":      externalUserID,
 	}
 	pipe := app.redis.Pipeline()
 	pipe.HSet(ctx, key, fields)
@@ -965,9 +1036,12 @@ func generateSessionToken(app *App, userID, inboxID int, isVisitor bool, externa
 
 // loadSession retrieves a session from Redis and refreshes its TTL using the
 // default duration for visitors and the current config duration for contacts.
-func loadSession(app *App, token string, config livechat.Config) (*WidgetSession, error) {
+func loadSession(app *App, token string, inbox imodels.Inbox, config livechat.Config, parentOrigin string) (*WidgetSession, error) {
 	ctx := context.Background()
 	key := widgetSessionPrefix + token
+	if inbox.ID <= 0 || inbox.Channel != livechat.ChannelLiveChat || !inbox.Enabled || inbox.WidgetSessionVersion < 1 {
+		return nil, fmt.Errorf("livechat inbox is unavailable")
+	}
 
 	data, err := app.redis.HGetAll(ctx, key).Result()
 	if err != nil {
@@ -977,27 +1051,65 @@ func loadSession(app *App, token string, config livechat.Config) (*WidgetSession
 		return nil, fmt.Errorf("session not found or expired")
 	}
 
-	userID, _ := strconv.Atoi(data["user_id"])
-	inboxID, _ := strconv.Atoi(data["inbox_id"])
-	isVisitor, _ := strconv.ParseBool(data["is_visitor"])
+	userID, userErr := strconv.Atoi(data["user_id"])
+	userSessionVersion, userVersionErr := strconv.ParseInt(data["user_session_version"], 10, 64)
+	inboxID, inboxErr := strconv.Atoi(data["inbox_id"])
+	sessionVersion, versionErr := strconv.ParseInt(data["inbox_session_version"], 10, 64)
+	isVisitor, visitorErr := strconv.ParseBool(data["is_visitor"])
+	canonicalOrigin, originOK := canonicalWidgetOrigin(parentOrigin)
+	if userErr != nil || userID <= 0 || userVersionErr != nil || userSessionVersion < 1 || inboxErr != nil || inboxID != inbox.ID ||
+		versionErr != nil || sessionVersion != inbox.WidgetSessionVersion || visitorErr != nil ||
+		!originOK || data["parent_origin"] != canonicalOrigin {
+		// Old, rotated, disabled-then-reenabled, or malformed sessions should not
+		// remain reusable if a caller later supplies stale inbox state.
+		_ = app.redis.Del(ctx, key).Err()
+		return nil, fmt.Errorf("session no longer matches the livechat inbox")
+	}
 
 	ttl := getSessionDuration(config)
 	if isVisitor {
 		ttl = defaultSessionTTL
 	}
-	app.redis.Expire(ctx, key, ttl)
+	if err := app.redis.Expire(ctx, key, ttl).Err(); err != nil {
+		return nil, fmt.Errorf("refreshing session expiry: %w", err)
+	}
 
 	return &WidgetSession{
-		UserID:         userID,
-		InboxID:        inboxID,
-		IsVisitor:      isVisitor,
-		ExternalUserID: data["external_user_id"],
+		UserID:              userID,
+		UserSessionVersion:  userSessionVersion,
+		InboxID:             inboxID,
+		InboxSessionVersion: sessionVersion,
+		ParentOrigin:        canonicalOrigin,
+		IsVisitor:           isVisitor,
+		ExternalUserID:      data["external_user_id"],
 	}, nil
 }
 
-// deleteSessionToken removes a session from Redis.
-func deleteSessionToken(app *App, token string) {
-	app.redis.Del(context.Background(), widgetSessionPrefix+token)
+// deleteSessionToken removes a session from Redis and reports revocation
+// failures so callers never claim logout succeeded while a bearer remains.
+func deleteSessionToken(app *App, token string) error {
+	if token == "" {
+		return nil
+	}
+	if app == nil || app.redis == nil {
+		return fmt.Errorf("widget session store is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := app.redis.Del(ctx, widgetSessionPrefix+token).Err(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("revoking widget session: %w", ctx.Err())
+		case <-time.After(time.Duration(attempt+1) * 50 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("revoking widget session: %w", lastErr)
 }
 
 // marshalCustomAttributes marshals custom attributes to JSON, returning "{}" on error or empty input.
@@ -1247,7 +1359,7 @@ func filterPreChatFormFields(fields []livechat.PreChatFormField, app *App) ([]li
 
 // getSessionDuration returns the configured session TTL for authenticated users.
 // Falls back to defaultSessionTTL if the config value is empty or invalid.
-// Enforces a minimum of 1 hour.
+// Enforces a minimum of 1 hour and a maximum of 30 days.
 func getSessionDuration(config livechat.Config) time.Duration {
 	if config.SessionDuration == "" {
 		return defaultSessionTTL
@@ -1255,6 +1367,9 @@ func getSessionDuration(config livechat.Config) time.Duration {
 	d, err := time.ParseDuration(config.SessionDuration)
 	if err != nil || d < minSessionTTL {
 		return defaultSessionTTL
+	}
+	if d > maxSessionTTL {
+		return maxSessionTTL
 	}
 	return d
 }

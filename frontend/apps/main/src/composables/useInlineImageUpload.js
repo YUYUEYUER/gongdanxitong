@@ -1,4 +1,5 @@
 import { useFileUpload } from './useFileUpload'
+import { isSafePreviewImage } from '@shared-ui/utils/file.js'
 
 // Must match ResizableImage's renderHTML output.
 const INLINE_IMAGE_MARKER = 'class="inline-image"'
@@ -116,8 +117,7 @@ export function useInlineImageUpload ({
         const imageFiles = []
         const otherFiles = []
         for (const file of fileList) {
-            // Force SVG into other.
-            if (file.type.startsWith('image/') && file.type !== 'image/svg+xml') {
+            if (isSafePreviewImage(file)) {
                 imageFiles.push(file)
             } else {
                 otherFiles.push(file)

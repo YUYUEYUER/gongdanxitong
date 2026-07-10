@@ -10,7 +10,6 @@ import (
 	"github.com/abhinavxd/libredesk/internal/inbox/channel/livechat"
 	imodels "github.com/abhinavxd/libredesk/internal/inbox/models"
 	umodels "github.com/abhinavxd/libredesk/internal/user/models"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/google/uuid"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -21,6 +20,8 @@ const (
 	ctxWidgetIsVisitor = "widget_is_visitor"
 	ctxWidgetInbox     = "widget_inbox"
 	ctxWidgetConfig    = "widget_config"
+	ctxWidgetOrigin    = "widget_parent_origin"
+	ctxWidgetToken     = "widget_session_token"
 
 	hdrWidgetInboxID      = "X-Libredesk-Inbox-ID"
 	hdrWidgetVisitorToken = "X-Libredesk-Visitor-Token"
@@ -60,9 +61,13 @@ func validateWidgetInbox(next func(*fastglue.Request) error) func(*fastglue.Requ
 			app.lo.Error("error parsing live chat config", "error", err)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 		}
+		parentOrigin, ok := validateWidgetParentOrigin(r.RequestCtx, config)
+		if !ok {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("status.deniedPermission"), nil, envelope.PermissionError)
+		}
 
 		if len(config.BlockedIPs) > 0 {
-			clientIP := realip.FromRequest(r.RequestCtx)
+			clientIP := app.rateLimit.ClientIP(r.RequestCtx)
 			if httputil.IsIPBlocked(clientIP, config.BlockedIPs) {
 				return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("widget.ipBlocked"), nil, envelope.PermissionError)
 			}
@@ -70,6 +75,7 @@ func validateWidgetInbox(next func(*fastglue.Request) error) func(*fastglue.Requ
 
 		r.RequestCtx.SetUserValue(ctxWidgetInbox, inbox)
 		r.RequestCtx.SetUserValue(ctxWidgetConfig, config)
+		r.RequestCtx.SetUserValue(ctxWidgetOrigin, parentOrigin)
 		return next(r)
 	}
 }
@@ -89,20 +95,33 @@ func widgetAuth(next func(*fastglue.Request) error) func(*fastglue.Request) erro
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 		}
 
-		authHeader := string(r.RequestCtx.Request.Header.Peek("Authorization"))
+		authHeader := strings.TrimSpace(string(r.RequestCtx.Request.Header.Peek("Authorization")))
+		token := ""
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		} else if authHeader != "" {
+			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("globals.terms.unAuthorized"), nil, envelope.UnauthorizedError)
+		}
+		if token == "" {
+			token = getWidgetTokenCookie(r.RequestCtx, inbox.UUID, widgetSessionCookie)
+		}
 
 		// For init endpoint, allow requests without token (visitor creation).
-		if authHeader == "" && strings.HasSuffix(string(r.RequestCtx.Path()), "/conversations/init") {
+		if token == "" && strings.HasSuffix(string(r.RequestCtx.Path()), "/conversations/init") {
 			return next(r)
 		}
 
-		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+		if token == "" || len(token) > 256 {
 			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("globals.terms.unAuthorized"), nil, envelope.UnauthorizedError)
 		}
-		token := strings.TrimPrefix(authHeader, "Bearer ")
 
-		session, err := loadSession(app, token, config)
+		parentOrigin, err := getWidgetParentOrigin(r)
 		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("status.deniedPermission"), nil, envelope.PermissionError)
+		}
+		session, err := loadSession(app, token, inbox, config, parentOrigin)
+		if err != nil {
+			clearWidgetTokenCookie(r.RequestCtx, inbox.UUID, widgetSessionCookie)
 			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("globals.terms.unAuthorized"), nil, envelope.UnauthorizedError)
 		}
 
@@ -113,23 +132,44 @@ func widgetAuth(next func(*fastglue.Request) error) func(*fastglue.Request) erro
 
 		// Verify user exists, is enabled, and is a contact or visitor.
 		u, err := app.user.Get(session.UserID, "", []string{umodels.UserTypeContact, umodels.UserTypeVisitor})
-		if err != nil || !u.Enabled {
+		if err != nil || !u.Enabled || u.SessionVersion != session.UserSessionVersion {
+			_ = deleteSessionToken(app, token)
 			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("globals.terms.unAuthorized"), nil, envelope.UnauthorizedError)
 		}
 
 		r.RequestCtx.SetUserValue(ctxWidgetContactID, session.UserID)
 		r.RequestCtx.SetUserValue(ctxWidgetIsVisitor, session.IsVisitor)
+		r.RequestCtx.SetUserValue(ctxWidgetToken, token)
+		// Migrate a legacy parent-page bearer token, and keep the partitioned
+		// cookie lifetime aligned with the Redis session's sliding expiry.
+		cookieTTL := getSessionDuration(config)
+		if session.IsVisitor {
+			cookieTTL = defaultSessionTTL
+		}
+		setWidgetTokenCookie(r.RequestCtx, inbox.UUID, token, widgetSessionCookie, cookieTTL)
 
 		// Merge visitor to contact if visitor token is provided.
 		visitorToken := string(r.RequestCtx.Request.Header.Peek(hdrWidgetVisitorToken))
+		if visitorToken == "" {
+			visitorToken = getWidgetTokenCookie(r.RequestCtx, inbox.UUID, widgetVisitorCookie)
+		}
 		if visitorToken != "" && session.ExternalUserID != "" && session.UserID > 0 {
-			visitorSession, vErr := loadSession(app, visitorToken, config)
+			visitorSession, vErr := loadSession(app, visitorToken, inbox, config, parentOrigin)
 			if vErr == nil && visitorSession.IsVisitor && visitorSession.UserID > 0 && visitorSession.UserID != session.UserID && visitorSession.InboxID == inbox.ID {
+				visitorUser, userErr := app.user.Get(visitorSession.UserID, "", []string{umodels.UserTypeVisitor})
+				if userErr != nil || !visitorUser.Enabled || visitorUser.SessionVersion != visitorSession.UserSessionVersion {
+					_ = deleteSessionToken(app, visitorToken)
+					return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("globals.terms.unAuthorized"), nil, envelope.UnauthorizedError)
+				}
 				if err := app.user.MergeVisitorToContact(visitorSession.UserID, session.UserID); err != nil {
 					app.lo.Error("error merging visitor to contact", "visitor_id", visitorSession.UserID, "contact_id", session.UserID, "error", err)
 				} else {
 					app.lo.Info("merged visitor to contact", "visitor_id", visitorSession.UserID, "contact_id", session.UserID)
-					deleteSessionToken(app, visitorToken)
+					if err := deleteSessionToken(app, visitorToken); err != nil {
+						app.lo.Error("error revoking merged visitor session", "error", err)
+						return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
+					}
+					clearWidgetTokenCookie(r.RequestCtx, inbox.UUID, widgetVisitorCookie)
 					r.RequestCtx.Response.Header.Set(hdrClearVisitorToken, "true")
 				}
 			}
@@ -165,6 +205,18 @@ func getWidgetIsVisitor(r *fastglue.Request) bool {
 	return v
 }
 
+// getWidgetSessionToken returns the authenticated token placed in context by
+// widgetAuth. It is exposed only to the isolated widget frame so the token can
+// remain in memory for Authorization headers and WebSocket joins.
+func getWidgetSessionToken(r *fastglue.Request) (string, error) {
+	val := r.RequestCtx.UserValue(ctxWidgetToken)
+	token, ok := val.(string)
+	if !ok || token == "" {
+		return "", fmt.Errorf("widget middleware not applied: missing session token")
+	}
+	return token, nil
+}
+
 // getWidgetInbox extracts inbox model from request context.
 func getWidgetInbox(r *fastglue.Request) (imodels.Inbox, error) {
 	val := r.RequestCtx.UserValue(ctxWidgetInbox)
@@ -189,4 +241,13 @@ func getWidgetConfig(r *fastglue.Request) (livechat.Config, error) {
 		return livechat.Config{}, fmt.Errorf("invalid config type in context")
 	}
 	return config, nil
+}
+
+func getWidgetParentOrigin(r *fastglue.Request) (string, error) {
+	value := r.RequestCtx.UserValue(ctxWidgetOrigin)
+	origin, ok := value.(string)
+	if !ok || origin == "" {
+		return "", fmt.Errorf("widget middleware not applied: missing parent origin")
+	}
+	return origin, nil
 }

@@ -45,17 +45,93 @@ type Client struct {
 
 	// Buffered channel of outbound ws messages.
 	Send chan models.WSMessage
+
+	// SessionExpiresAt is the absolute upper bound for this connection.
+	SessionExpiresAt time.Time
+
+	// ValidateSession rechecks mutable authentication state while connected.
+	ValidateSession func() bool
+
+	// SessionValidationInterval controls how often ValidateSession runs.
+	SessionValidationInterval time.Duration
+
+	closeOnce       sync.Once
+	sendMu          sync.RWMutex
+	rateMu          sync.Mutex
+	rateWindowStart time.Time
+	rateCount       int
 }
+
+const (
+	maxInboundMessageBytes           = 64 << 10
+	maxInboundMessages               = 120
+	inboundRateWindow                = time.Minute
+	pongWait                         = 60 * time.Second
+	pingPeriod                       = 30 * time.Second
+	writeWait                        = 10 * time.Second
+	defaultSessionValidationInterval = 15 * time.Second
+)
 
 // Serve handles heartbeats and sending messages to the client.
 func (c *Client) Serve() {
-	var heartBeatTicker = time.NewTicker(2 * time.Second)
+	if c.sessionExpired(time.Now()) {
+		c.writeSessionClose("session expired")
+		_ = c.Conn.Close()
+		return
+	}
+
+	heartBeatTicker := time.NewTicker(pingPeriod)
 	defer heartBeatTicker.Stop()
 	defer c.Conn.Close()
-	
+
+	var (
+		expiryTimer      *time.Timer
+		expiry           <-chan time.Time
+		validationTicker *time.Ticker
+		validation       <-chan time.Time
+		validationResult = make(chan bool, 1)
+		validationActive bool
+	)
+	if !c.SessionExpiresAt.IsZero() {
+		expiryTimer = time.NewTimer(time.Until(c.SessionExpiresAt))
+		expiry = expiryTimer.C
+		defer expiryTimer.Stop()
+	}
+	if c.ValidateSession != nil {
+		interval := c.SessionValidationInterval
+		if interval <= 0 {
+			interval = defaultSessionValidationInterval
+		}
+		validationTicker = time.NewTicker(interval)
+		validation = validationTicker.C
+		defer validationTicker.Stop()
+	}
+	startValidation := func() {
+		if c.ValidateSession == nil || validationActive {
+			return
+		}
+		validationActive = true
+		go func() {
+			validationResult <- c.sessionValid(time.Now())
+		}()
+	}
+	startValidation()
+
 	for {
 		select {
+		case <-expiry:
+			c.writeSessionClose("session expired")
+			return
+		case valid := <-validationResult:
+			validationActive = false
+			if !valid {
+				c.writeSessionClose("session revoked")
+				return
+			}
+		case <-validation:
+			startValidation()
 		case <-heartBeatTicker.C:
+			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -63,20 +139,53 @@ func (c *Client) Serve() {
 			if !ok {
 				return
 			}
-			c.Conn.WriteMessage(msg.MessageType, msg.Data)
+			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.Conn.WriteMessage(msg.MessageType, msg.Data); err != nil {
+				return
+			}
 		}
 	}
 }
 
+func (c *Client) sessionExpired(now time.Time) bool {
+	return !c.SessionExpiresAt.IsZero() && !now.Before(c.SessionExpiresAt)
+}
+
+func (c *Client) sessionValid(now time.Time) bool {
+	if c.sessionExpired(now) {
+		return false
+	}
+	return c.ValidateSession == nil || c.ValidateSession()
+}
+
+func (c *Client) writeSessionClose(reason string) {
+	_ = c.Conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
+		time.Now().Add(writeWait),
+	)
+}
+
 // Listen is a block method that listens for incoming messages from the client.
 func (c *Client) Listen() {
+	c.Conn.SetReadLimit(maxInboundMessageBytes)
+	_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.Conn.SetPongHandler(func(string) error {
+		return c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
 	for {
 		msgType, msg, err := c.Conn.ReadMessage()
 		if err != nil {
 			break
 		}
+		_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		if msgType == websocket.TextMessage {
+			if !c.allowIncoming(time.Now()) {
+				c.SendError("message rate limit exceeded")
+				break
+			}
 			c.processIncomingMessage(msg)
 		} else {
 			c.Hub.RemoveClient(c)
@@ -86,6 +195,17 @@ func (c *Client) Listen() {
 	}
 	c.Hub.RemoveClient(c)
 	c.close()
+}
+
+func (c *Client) allowIncoming(now time.Time) bool {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	if c.rateWindowStart.IsZero() || now.Sub(c.rateWindowStart) >= inboundRateWindow {
+		c.rateWindowStart = now
+		c.rateCount = 0
+	}
+	c.rateCount++
+	return c.rateCount <= maxInboundMessages
 }
 
 // processIncomingMessage processes incoming messages from the client.
@@ -171,11 +291,6 @@ func (c *Client) handleConversationSubscribe(data interface{}) {
 }
 
 // handleTyping handles typing indicator messages.
-//
-// Same trust assumption as handleConversationSubscribe: the sender is an
-// authenticated agent. A hostile agent could broadcast fake typing to any
-// conversation UUID (including widget clients), but typing is ephemeral and
-// cosmetic; adding per-frame authz isn't worth the DB cost today.
 func (c *Client) handleTyping(data interface{}) {
 	// Convert the data to JSON and then unmarshal to TypingMessage
 	dataBytes, err := json.Marshal(data)
@@ -195,13 +310,22 @@ func (c *Client) handleTyping(data interface{}) {
 		return
 	}
 
+	authorized, err := c.Hub.conversationStore.FilterAuthorizedListUUIDs(c.ID, []string{typingMsg.ConversationUUID})
+	if err != nil || len(authorized) == 0 {
+		return
+	}
+
 	c.Hub.BroadcastTypingToConversation(typingMsg.ConversationUUID, typingMsg)
 }
 
 // close closes the client connection.
 func (c *Client) close() {
-	c.Closed.Set(true)
-	close(c.Send)
+	c.closeOnce.Do(func() {
+		c.sendMu.Lock()
+		defer c.sendMu.Unlock()
+		c.Closed.Set(true)
+		close(c.Send)
+	})
 }
 
 // SendError sends an error message to client.
@@ -212,9 +336,7 @@ func (c *Client) SendError(msg string) {
 	}
 	b, _ := json.Marshal(out)
 
-	select {
-	case c.Send <- models.WSMessage{Data: b, MessageType: websocket.TextMessage}:
-	default:
+	if !c.enqueue(models.WSMessage{Data: b, MessageType: websocket.TextMessage}) {
 		c.Hub.lo.Warn("client send channel full, could not send error message", "client_id", c.ID)
 		c.Hub.RemoveClient(c)
 		c.close()
@@ -223,12 +345,19 @@ func (c *Client) SendError(msg string) {
 
 // SendMessage sends a message to client.
 func (c *Client) SendMessage(b []byte, typ byte) {
+	c.enqueue(models.WSMessage{Data: b, MessageType: int(typ)})
+}
+
+func (c *Client) enqueue(msg models.WSMessage) bool {
+	c.sendMu.RLock()
+	defer c.sendMu.RUnlock()
 	if c.Closed.Get() {
-		c.Hub.lo.Warn("attempted to send message to closed client", "client_id", c.ID)
-		return
+		return false
 	}
 	select {
-	case c.Send <- models.WSMessage{Data: b, MessageType: websocket.TextMessage}:
+	case c.Send <- msg:
+		return true
 	default:
+		return false
 	}
 }

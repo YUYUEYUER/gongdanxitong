@@ -11,23 +11,36 @@ VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING *
 
 -- name: get-inbox
-SELECT id, uuid, created_at, updated_at, "name", deleted_at, channel, enabled, csat_enabled, prompt_tags_on_reply, config, "from", from_name_template, secret, linked_email_inbox_id FROM inboxes where id = $1 and deleted_at is NULL;
+SELECT id, uuid, created_at, updated_at, "name", deleted_at, channel, enabled, csat_enabled, prompt_tags_on_reply, config, "from", from_name_template, secret, widget_session_version, linked_email_inbox_id FROM inboxes where id = $1 and deleted_at is NULL;
 
 -- name: get-inbox-by-uuid
-SELECT id, uuid, created_at, updated_at, "name", deleted_at, channel, enabled, csat_enabled, prompt_tags_on_reply, config, "from", from_name_template, secret, linked_email_inbox_id FROM inboxes where uuid = $1 and deleted_at is NULL;
+SELECT id, uuid, created_at, updated_at, "name", deleted_at, channel, enabled, csat_enabled, prompt_tags_on_reply, config, "from", from_name_template, secret, widget_session_version, linked_email_inbox_id FROM inboxes where uuid = $1 and deleted_at is NULL;
 
 -- name: update
 UPDATE inboxes
-set channel = $2, config = $3, "name" = $4, "from" = $5, csat_enabled = $6, prompt_tags_on_reply = $7, enabled = $8, secret = $9, linked_email_inbox_id = $10, from_name_template = $11, updated_at = now()
+set channel = $2, config = $3, "name" = $4, "from" = $5, csat_enabled = $6, prompt_tags_on_reply = $7, enabled = $8, secret = $9, linked_email_inbox_id = $10, from_name_template = $11, widget_session_version = $12, updated_at = now()
 where id = $1 and deleted_at is NULL
 RETURNING *;
 
 -- name: soft-delete
-UPDATE inboxes set deleted_at = now(), updated_at = now(), config = '{}', enabled = false where id = $1 and deleted_at is NULL;
+UPDATE inboxes
+SET deleted_at = now(),
+    updated_at = now(),
+    config = '{}',
+    enabled = false,
+    widget_session_version = CASE
+        WHEN channel = 'livechat' THEN widget_session_version + 1
+        ELSE widget_session_version
+    END
+WHERE id = $1 AND deleted_at IS NULL;
 
 -- name: toggle
 UPDATE inboxes
 SET enabled = NOT enabled, updated_at = NOW()
+    , widget_session_version = CASE
+        WHEN channel = 'livechat' THEN widget_session_version + 1
+        ELSE widget_session_version
+    END
 WHERE id = $1
 RETURNING *;
 

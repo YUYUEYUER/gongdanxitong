@@ -3,8 +3,8 @@
     <div class="p-8">
       <!-- Logo -->
       <img
-        v-if="config.logo_url"
-        :src="config.logo_url"
+        v-if="safeLogoUrl"
+        :src="safeLogoUrl"
         :alt="config.brand_name"
         class="max-h-8 max-w-full"
       />
@@ -33,6 +33,7 @@
 import { computed } from 'vue'
 import { useUserStore } from '@widget/store/user.js'
 import { renderTemplate } from '@shared-ui/utils/string.js'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 
 const props = defineProps({
   config: {
@@ -54,6 +55,8 @@ const parsedIntroduction = computed(() =>
   renderTemplate(props.config.introduction_message, userData.value)
 )
 
+const safeLogoUrl = computed(() => sanitizeHttpUrl(props.config.logo_url))
+
 const headerStyle = computed(() => {
   const hs = props.config.home_screen
   if (!hs?.background?.type) return {}
@@ -70,7 +73,9 @@ const headerStyle = computed(() => {
       break
     case 'image':
       if (hs.background.image_url) {
-        style.backgroundImage = `url(${hs.background.image_url})`
+        const safeImageURL = sanitizeHttpUrl(hs.background.image_url)
+        if (!safeImageURL) break
+        style.backgroundImage = `url("${safeImageURL.replace(/["\\]/g, '\\$&')}")`
         style.backgroundSize = 'cover'
         style.backgroundPosition = 'center'
       }

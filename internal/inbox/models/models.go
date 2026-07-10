@@ -22,20 +22,21 @@ const (
 
 // Inbox represents a inbox record in DB.
 type Inbox struct {
-	ID                 int             `db:"id" json:"id"`
-	UUID               string          `db:"uuid" json:"uuid"`
-	CreatedAt          time.Time       `db:"created_at" json:"created_at"`
-	UpdatedAt          time.Time       `db:"updated_at" json:"updated_at"`
-	Name               string          `db:"name" json:"name"`
-	Channel            string          `db:"channel" json:"channel"`
-	Enabled            bool            `db:"enabled" json:"enabled"`
-	CSATEnabled        bool            `db:"csat_enabled" json:"csat_enabled"`
-	PromptTagsOnReply  bool            `db:"prompt_tags_on_reply" json:"prompt_tags_on_reply"`
-	From               string          `db:"from" json:"from"`
-	FromNameTemplate   string          `db:"from_name_template" json:"from_name_template"`
-	Config             json.RawMessage `db:"config" json:"config"`
-	Secret             null.String     `db:"secret" json:"secret"`
-	LinkedEmailInboxID null.Int        `db:"linked_email_inbox_id" json:"linked_email_inbox_id"`
+	ID                   int             `db:"id" json:"id"`
+	UUID                 string          `db:"uuid" json:"uuid"`
+	CreatedAt            time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt            time.Time       `db:"updated_at" json:"updated_at"`
+	Name                 string          `db:"name" json:"name"`
+	Channel              string          `db:"channel" json:"channel"`
+	Enabled              bool            `db:"enabled" json:"enabled"`
+	CSATEnabled          bool            `db:"csat_enabled" json:"csat_enabled"`
+	PromptTagsOnReply    bool            `db:"prompt_tags_on_reply" json:"prompt_tags_on_reply"`
+	From                 string          `db:"from" json:"from"`
+	FromNameTemplate     string          `db:"from_name_template" json:"from_name_template"`
+	Config               json.RawMessage `db:"config" json:"config"`
+	Secret               null.String     `db:"secret" json:"secret"`
+	WidgetSessionVersion int64           `db:"widget_session_version" json:"-"`
+	LinkedEmailInboxID   null.Int        `db:"linked_email_inbox_id" json:"linked_email_inbox_id"`
 }
 
 // Config holds the email inbox configuration with multiple SMTP servers and IMAP clients.

@@ -24,7 +24,7 @@
             class="w-full"
           >
             <img
-              :src="oidcProvider.logo_url"
+              :src="sanitizeHttpUrl(oidcProvider.logo_url)"
               :alt="oidcProvider.name"
               width="20"
               v-if="oidcProvider.logo_url"
@@ -132,6 +132,7 @@
 <script setup>
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { sanitizeHttpUrl, sanitizeInternalPath } from '@shared-ui/utils/url.js'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import api from '../../api'
 import { validateEmail } from '@shared-ui/utils/string'
@@ -206,7 +207,7 @@ const fetchOIDCProviders = async () => {
 
 const redirectToOIDC = (provider) => {
   // Pass the 'next' parameter to OIDC login if it exists
-  const nextParam = router.currentRoute.value.query.next
+  const nextParam = sanitizeInternalPath(String(router.currentRoute.value.query.next || ''))
   const url = nextParam
     ? `/api/v1/oidc/${provider.id}/login?next=${encodeURIComponent(nextParam)}`
     : `/api/v1/oidc/${provider.id}/login`

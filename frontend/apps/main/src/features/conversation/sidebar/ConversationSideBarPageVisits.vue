@@ -7,7 +7,7 @@
       <a
         v-for="(page, idx) in pageVisits"
         :key="idx"
-        :href="page.url"
+        :href="sanitizeHttpUrl(page.url) || undefined"
         target="_blank"
         rel="noopener noreferrer"
         class="block p-2 rounded hover:bg-muted"
@@ -49,6 +49,7 @@ import { useI18n } from 'vue-i18n'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@shared-ui/components/ui/tooltip'
 import { getRelativeTime, formatFullTimestamp } from '@shared-ui/utils/datetime.js'
 import api from '../../../api'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 
 const conversationStore = useConversationStore()
 const conversation = computed(() => conversationStore.current)

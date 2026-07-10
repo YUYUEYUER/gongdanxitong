@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -10,11 +11,21 @@ import (
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/image"
 	"github.com/abhinavxd/libredesk/internal/user/models"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
-	"github.com/zerodha/simplesessions/v3"
 )
+
+const maxPublicJSONBodyBytes = 128 * 1024
+
+func requestBodyLimit(handler fastglue.FastRequestHandler, maxBytes int) fastglue.FastRequestHandler {
+	return func(r *fastglue.Request) error {
+		if maxBytes <= 0 || len(r.RequestCtx.PostBody()) > maxBytes {
+			app := r.Context.(*App)
+			return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, app.i18n.T("globals.messages.badRequest"), nil, envelope.InputError)
+		}
+		return handler(r)
+	}
+}
 
 func validateCSRFCookie(r *fastglue.Request, app *App) error {
 	method := string(r.RequestCtx.Method())
@@ -29,7 +40,7 @@ func validateCSRFCookie(r *fastglue.Request, app *App) error {
 			"csrf token mismatch",
 			"method", method,
 			"path", string(r.RequestCtx.Path()),
-			"ip", realip.FromRequest(r.RequestCtx),
+			"ip", requestClientIP(app, r.RequestCtx),
 			"user_agent", string(r.RequestCtx.UserAgent()),
 			"has_cookie_token", cookieToken != "",
 			"has_header_token", hdrToken != "",
@@ -42,6 +53,29 @@ func validateCSRFCookie(r *fastglue.Request, app *App) error {
 	return nil
 }
 
+func requestClientIP(app *App, ctx *fasthttp.RequestCtx) string {
+	if app.rateLimit != nil {
+		return app.rateLimit.ClientIP(ctx)
+	}
+	return ctx.RemoteIP().String()
+}
+
+func safeNextPath(raw, fallback string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, "\\\r\n") || strings.HasPrefix(raw, "//") {
+		return fallback
+	}
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || !strings.HasPrefix(parsed.Path, "/") {
+		return fallback
+	}
+	decodedPath, err := url.PathUnescape(parsed.EscapedPath())
+	if err != nil || strings.HasPrefix(decodedPath, "//") || strings.Contains(decodedPath, "\\") {
+		return fallback
+	}
+	return parsed.RequestURI()
+}
+
 func shortHash(value string) string {
 	hash := sha256Hex(value)
 	if len(hash) <= 12 {
@@ -52,6 +86,56 @@ func shortHash(value string) string {
 
 func sessionTypeAllowed(sessUser models.User, allowedTypes []string) bool {
 	return sessUser.ID > 0 && slices.Contains(allowedTypes, sessUser.Type)
+}
+
+func validateAgentSessionUser(r *fastglue.Request, app *App) (models.User, error) {
+	sessUser, err := app.auth.ValidateSession(r)
+	if err != nil || !sessionTypeAllowed(sessUser, []string{models.UserTypeAgent}) {
+		return models.User{}, envelope.NewError(envelope.GeneralError, app.i18n.T("auth.invalidOrExpiredSession"), nil)
+	}
+
+	user, err := app.user.GetAgentCachedOrLoad(sessUser.ID)
+	if err != nil {
+		return user, err
+	}
+	if sessUser.SessionVersion != user.SessionVersion {
+		if destroyErr := app.auth.DestroySession(r); destroyErr != nil {
+			app.lo.Error("error destroying revoked agent session", "error", destroyErr)
+		}
+		return models.User{}, envelope.NewError(envelope.GeneralError, app.i18n.T("auth.invalidOrExpiredSession"), nil)
+	}
+	if !user.Enabled {
+		if destroyErr := app.auth.DestroySession(r); destroyErr != nil {
+			app.lo.Error("error destroying disabled agent session", "error", destroyErr)
+		}
+		return user, envelope.NewError(envelope.PermissionError, app.i18n.T("user.accountDisabled"), nil)
+	}
+	return user, nil
+}
+
+func validateCustomerSessionUser(r *fastglue.Request, app *App) (models.User, error) {
+	sessUser, err := app.customerAuth.ValidateSession(r)
+	if err != nil || !sessionTypeAllowed(sessUser, []string{models.UserTypeContact}) {
+		return models.User{}, envelope.NewError(envelope.GeneralError, app.i18n.T("auth.invalidOrExpiredSession"), nil)
+	}
+
+	user, err := app.user.Get(sessUser.ID, "", []string{models.UserTypeContact})
+	if err != nil {
+		return user, err
+	}
+	if sessUser.SessionVersion != user.SessionVersion {
+		if destroyErr := app.customerAuth.DestroySession(r); destroyErr != nil {
+			app.lo.Error("error destroying revoked customer session", "error", destroyErr)
+		}
+		return models.User{}, envelope.NewError(envelope.GeneralError, app.i18n.T("auth.invalidOrExpiredSession"), nil)
+	}
+	if !user.Enabled {
+		if destroyErr := app.customerAuth.DestroySession(r); destroyErr != nil {
+			app.lo.Error("error destroying disabled customer session", "error", destroyErr)
+		}
+		return user, envelope.NewError(envelope.PermissionError, app.i18n.T("user.accountDisabled"), nil)
+	}
+	return user, nil
 }
 
 // authenticateAgentUser handles both API key and agent session authentication.
@@ -72,22 +156,10 @@ func authenticateAgentUser(r *fastglue.Request, app *App) (models.User, error) {
 		return user, err
 	}
 
-	sessUser, err := app.auth.ValidateSession(r)
-	if err != nil || !sessionTypeAllowed(sessUser, []string{models.UserTypeAgent}) {
+	user, err = validateAgentSessionUser(r, app)
+	if err != nil {
 		app.lo.Error("error validating agent session", "error", err)
 		return user, envelope.NewError(envelope.GeneralError, app.i18n.T("auth.invalidOrExpiredSession"), nil)
-	}
-
-	user, err = app.user.GetAgentCachedOrLoad(sessUser.ID)
-	if err != nil {
-		return user, err
-	}
-
-	if !user.Enabled {
-		if err := app.auth.DestroySession(r); err != nil {
-			app.lo.Error("error destroying session", "error", err)
-		}
-		return user, envelope.NewError(envelope.PermissionError, app.i18n.T("user.accountDisabled"), nil)
 	}
 
 	r.RequestCtx.SetUserValue("auth_method", "session")
@@ -102,22 +174,10 @@ func authenticateCustomerUser(r *fastglue.Request, app *App) (models.User, error
 		return user, err
 	}
 
-	sessUser, err := app.customerAuth.ValidateSession(r)
-	if err != nil || !sessionTypeAllowed(sessUser, []string{models.UserTypeContact}) {
+	user, err := validateCustomerSessionUser(r, app)
+	if err != nil {
 		app.lo.Error("error validating customer session", "error", err)
 		return user, envelope.NewError(envelope.GeneralError, app.i18n.T("auth.invalidOrExpiredSession"), nil)
-	}
-
-	user, err = app.user.Get(sessUser.ID, "", []string{models.UserTypeContact})
-	if err != nil {
-		return user, err
-	}
-
-	if !user.Enabled {
-		if err := app.customerAuth.DestroySession(r); err != nil {
-			app.lo.Error("error destroying customer session", "error", err)
-		}
-		return user, envelope.NewError(envelope.PermissionError, app.i18n.T("user.accountDisabled"), nil)
 	}
 
 	r.RequestCtx.SetUserValue("auth_method", "customer_session")
@@ -271,27 +331,13 @@ func authPage(handler fastglue.FastRequestHandler) fastglue.FastRequestHandler {
 	return func(r *fastglue.Request) error {
 		app := r.Context.(*App)
 
-		user, err := app.auth.ValidateSession(r)
-		if err != nil {
-			if err != simplesessions.ErrInvalidSession {
-				app.lo.Error("error validating session", "error", err)
-				return r.SendErrorEnvelope(http.StatusUnauthorized, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
-			}
-			if err := app.auth.DestroySession(r); err != nil {
-				app.lo.Error("error destroying session", "error", err)
-			}
-		}
-
-		if sessionTypeAllowed(user, []string{models.UserTypeAgent}) {
+		if _, err := validateAgentSessionUser(r, app); err == nil {
 			return handler(r)
 		}
 
-		nextURI := r.RequestCtx.QueryArgs().Peek("next")
-		if len(nextURI) == 0 {
-			nextURI = r.RequestCtx.RequestURI()
-		}
+		nextURI := safeNextPath(string(r.RequestCtx.QueryArgs().Peek("next")), string(r.RequestCtx.Path()))
 		return r.RedirectURI("/", fasthttp.StatusFound, map[string]any{
-			"next": string(nextURI),
+			"next": nextURI,
 		}, "")
 	}
 }
@@ -301,17 +347,8 @@ func notAuthPage(handler fastglue.FastRequestHandler) fastglue.FastRequestHandle
 	return func(r *fastglue.Request) error {
 		app := r.Context.(*App)
 
-		user, err := app.auth.ValidateSession(r)
-		if err != nil && err != simplesessions.ErrInvalidSession {
-			app.lo.Error("error validating session", "error", err)
-			return r.SendErrorEnvelope(http.StatusUnauthorized, app.i18n.T("auth.invalidOrExpiredSessionClearCookie"), nil, envelope.GeneralError)
-		}
-
-		if sessionTypeAllowed(user, []string{models.UserTypeAgent}) {
-			nextURI := string(r.RequestCtx.QueryArgs().Peek("next"))
-			if nextURI == "" {
-				nextURI = "/inboxes/assigned"
-			}
+		if _, err := validateAgentSessionUser(r, app); err == nil {
+			nextURI := safeNextPath(string(r.RequestCtx.QueryArgs().Peek("next")), "/inboxes/assigned")
 			return r.RedirectURI(nextURI, fasthttp.StatusFound, nil, "")
 		}
 		return handler(r)
@@ -323,23 +360,12 @@ func customerAuthPage(handler fastglue.FastRequestHandler) fastglue.FastRequestH
 	return func(r *fastglue.Request) error {
 		app := r.Context.(*App)
 
-		user, err := app.customerAuth.ValidateSession(r)
-		if err != nil && err != simplesessions.ErrInvalidSession {
-			app.lo.Error("error validating customer session", "error", err)
-		}
-
-		if sessionTypeAllowed(user, []string{models.UserTypeContact}) {
+		if _, err := validateCustomerSessionUser(r, app); err == nil {
 			return handler(r)
 		}
 
-		if err == simplesessions.ErrInvalidSession {
-			if destroyErr := app.customerAuth.DestroySession(r); destroyErr != nil {
-				app.lo.Error("error destroying invalid customer session", "error", destroyErr)
-			}
-		}
-
 		return r.RedirectURI("/portal/login", fasthttp.StatusFound, map[string]any{
-			"next": string(r.RequestCtx.RequestURI()),
+			"next": safeNextPath(string(r.RequestCtx.RequestURI()), "/portal/tickets"),
 		}, "")
 	}
 }
@@ -349,16 +375,8 @@ func customerNotAuthPage(handler fastglue.FastRequestHandler) fastglue.FastReque
 	return func(r *fastglue.Request) error {
 		app := r.Context.(*App)
 
-		user, err := app.customerAuth.ValidateSession(r)
-		if err != nil && err != simplesessions.ErrInvalidSession {
-			app.lo.Error("error validating customer session", "error", err)
-		}
-
-		if sessionTypeAllowed(user, []string{models.UserTypeContact}) {
-			nextURI := string(r.RequestCtx.QueryArgs().Peek("next"))
-			if nextURI == "" {
-				nextURI = "/portal/tickets"
-			}
+		if _, err := validateCustomerSessionUser(r, app); err == nil {
+			nextURI := safeNextPath(string(r.RequestCtx.QueryArgs().Peek("next")), "/portal/tickets")
 			return r.RedirectURI(nextURI, fasthttp.StatusFound, nil, "")
 		}
 
@@ -375,19 +393,8 @@ func publicTicketPage(handler fastglue.FastRequestHandler) fastglue.FastRequestH
 
 		app := r.Context.(*App)
 
-		user, err := app.customerAuth.ValidateSession(r)
-		if err != nil && err != simplesessions.ErrInvalidSession {
-			app.lo.Error("error validating session for public ticket page", "error", err)
-		}
-
-		if sessionTypeAllowed(user, []string{models.UserTypeContact}) {
+		if _, err := validateCustomerSessionUser(r, app); err == nil {
 			return handler(r)
-		}
-
-		if err == simplesessions.ErrInvalidSession {
-			if destroyErr := app.customerAuth.DestroySession(r); destroyErr != nil {
-				app.lo.Error("error destroying invalid session", "error", destroyErr)
-			}
 		}
 
 		return r.RedirectURI("/portal/login", fasthttp.StatusFound, map[string]any{
@@ -446,9 +453,7 @@ func authOrSignedURL(handler fastglue.FastRequestHandler) fastglue.FastRequestHa
 		}
 
 		uuid := r.RequestCtx.UserValue("uuid").(string)
-		signatureUUID := strings.TrimPrefix(uuid, image.ThumbPrefix)
-
-		if !validator(signatureUUID, sig, exp) {
+		if !validMediaSignature(validator, uuid, sig, exp) {
 			return r.SendErrorEnvelope(http.StatusForbidden,
 				app.i18n.T("media.invalidOrExpiredURL"), nil, envelope.PermissionError)
 		}
@@ -456,4 +461,16 @@ func authOrSignedURL(handler fastglue.FastRequestHandler) fastglue.FastRequestHa
 		r.RequestCtx.SetUserValue("auth_method", "signed_url")
 		return handler(r)
 	}
+}
+
+func validMediaSignature(validator func(name, sig string, exp int64) bool, name, sig string, exp int64) bool {
+	if validator == nil || name == "" {
+		return false
+	}
+	if validator(name, sig, exp) {
+		return true
+	}
+	// Compatibility with thumbnail links emitted before thumbnail names were
+	// signed independently.
+	return strings.HasPrefix(name, image.ThumbPrefix) && validator(strings.TrimPrefix(name, image.ThumbPrefix), sig, exp)
 }

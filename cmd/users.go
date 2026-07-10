@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
-	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -16,14 +17,21 @@ import (
 	"github.com/abhinavxd/libredesk/internal/stringutil"
 	tmpl "github.com/abhinavxd/libredesk/internal/template"
 	"github.com/abhinavxd/libredesk/internal/user/models"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 	"github.com/volatiletech/null/v9"
 	"github.com/zerodha/fastglue"
 )
 
 const (
-	maxAvatarSizeMB = 2
+	maxAvatarSizeMB    = 2
+	maxAvatarSizeBytes = int64(maxAvatarSizeMB * 1024 * 1024)
+	avatarFilename     = "avatar.png"
+	avatarContentType  = "image/png"
+)
+
+var (
+	errAvatarTooLarge = errors.New("avatar upload is too large")
+	errAvatarInvalid  = errors.New("avatar upload is not a supported image")
 )
 
 type resetPasswordRequest struct {
@@ -93,7 +101,7 @@ func handleUpdateAgentAvailability(r *fastglue.Request) error {
 	var (
 		app      = r.Context.(*App)
 		auser    = r.RequestCtx.UserValue("user").(amodels.User)
-		ip       = realip.FromRequest(r.RequestCtx)
+		ip       = requestClientIP(app, r.RequestCtx)
 		availReq availabilityRequest
 	)
 
@@ -252,7 +260,7 @@ func handleUpdateAgent(r *fastglue.Request) error {
 		app   = r.Context.(*App)
 		req   = agentReq{}
 		auser = r.RequestCtx.UserValue("user").(amodels.User)
-		ip    = realip.FromRequest(r.RequestCtx)
+		ip    = requestClientIP(app, r.RequestCtx)
 		id, _ = strconv.Atoi(r.RequestCtx.UserValue("id").(string))
 	)
 	if id == 0 {
@@ -281,6 +289,12 @@ func handleUpdateAgent(r *fastglue.Request) error {
 
 	app.user.InvalidateAgentCache(id)
 	app.wsHub.KickUser(id)
+	// A concurrent request may have started reloading the old team membership
+	// before the write below. Invalidate and disconnect again after every exit.
+	defer func() {
+		app.user.InvalidateAgentCache(id)
+		app.wsHub.KickUser(id)
+	}()
 
 	// Create activity log if user availability status changed.
 	if oldAvailabilityStatus != req.AvailabilityStatus {
@@ -373,10 +387,8 @@ func handleDeleteCurrentAgentAvatar(r *fastglue.Request) error {
 		return r.SendEnvelope(true)
 	}
 
-	fileName := filepath.Base(agent.AvatarURL.String)
-
-	// Delete file from the store.
-	if err := app.media.Delete(fileName); err != nil {
+	// Delete only a media object proven to belong to this user.
+	if err := deleteOwnedUserAvatarMedia(app, agent.ID, agent.AvatarURL.String); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
@@ -394,6 +406,12 @@ func handleResetPassword(r *fastglue.Request) error {
 		auser, ok = r.RequestCtx.UserValue("user").(amodels.User)
 		resetReq  resetPasswordRequest
 	)
+	if err := requireJSONPost(r.RequestCtx, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := validateCSRFCookie(r, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 	if ok && auser.ID > 0 {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("user.userAlreadyLoggedIn"), nil, envelope.InputError)
 	}
@@ -447,6 +465,12 @@ func handleSetPassword(r *fastglue.Request) error {
 		agent, ok = r.RequestCtx.UserValue("user").(amodels.User)
 		req       setPasswordRequest
 	)
+	if err := requireJSONPost(r.RequestCtx, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := validateCSRFCookie(r, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	if ok && agent.ID > 0 {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("user.userAlreadyLoggedIn"), nil, envelope.InputError)
@@ -460,7 +484,7 @@ func handleSetPassword(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.Ts("globals.messages.empty", "name", "{globals.terms.password}"), nil, envelope.InputError)
 	}
 
-	id, err := app.user.ResetPassword(req.Token, req.Password)
+	id, err := app.user.ResetPassword(req.Token, req.Password, models.UserTypeAgent)
 	if err != nil {
 		return sendErrorEnvelope(r, err)
 	}
@@ -474,60 +498,86 @@ func handleSetPassword(r *fastglue.Request) error {
 func uploadUserAvatar(r *fastglue.Request, user models.User, files []*multipart.FileHeader) error {
 	var app = r.Context.(*App)
 
-	fileHeader := files[0]
-	file, err := fileHeader.Open()
-	if err != nil {
-		app.lo.Error("error opening uploaded file", "user_id", user.ID, "error", err)
-		return envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.errorUploadingFile"), nil)
-	}
-	defer file.Close()
-
-	// Sanitize filename.
-	srcFileName := stringutil.SanitizeFilename(fileHeader.Filename)
-	srcContentType := fileHeader.Header.Get("Content-Type")
-	srcFileSize := fileHeader.Size
-	srcExt := strings.TrimPrefix(strings.ToLower(filepath.Ext(srcFileName)), ".")
-
-	if !slices.Contains(image.Exts, srcExt) {
+	if len(files) == 0 {
 		return envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.fileTypeisNotAnImage"), nil)
 	}
-
-	// Check file size
-	if bytesToMegabytes(srcFileSize) > maxAvatarSizeMB {
-		app.lo.Error("error uploaded file size is larger than max allowed", "user_id", user.ID, "size", bytesToMegabytes(srcFileSize), "max_allowed", maxAvatarSizeMB)
-		return envelope.NewError(
-			envelope.InputError,
-			app.i18n.Ts("media.fileSizeTooLarge", "size", fmt.Sprintf("%dMB", maxAvatarSizeMB)),
-			nil,
-		)
+	avatar, err := prepareUserAvatar(files[0])
+	if err != nil {
+		if errors.Is(err, errAvatarTooLarge) {
+			app.lo.Error("error uploaded file size is larger than max allowed", "user_id", user.ID, "max_allowed", maxAvatarSizeMB)
+			return envelope.NewError(
+				envelope.InputError,
+				app.i18n.Ts("media.fileSizeTooLarge", "size", fmt.Sprintf("%dMB", maxAvatarSizeMB)),
+				nil,
+			)
+		}
+		if errors.Is(err, errAvatarInvalid) {
+			app.lo.Warn("rejected invalid avatar upload", "user_id", user.ID, "error", err)
+			return envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.fileTypeisNotAnImage"), nil)
+		}
+		app.lo.Error("error preparing uploaded avatar", "user_id", user.ID, "error", err)
+		return envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.errorUploadingFile"), nil)
 	}
 
-	// Reset ptr.
-	file.Seek(0, 0)
 	linkedModel := null.StringFrom(mmodels.ModelUser)
 	linkedID := null.IntFrom(user.ID)
 	disposition := null.NewString("", false)
 	contentID := ""
 	meta := []byte("{}")
-	media, err := app.media.UploadAndInsert(srcFileName, srcContentType, contentID, linkedModel, linkedID, null.IntFrom(user.ID), file, int(srcFileSize), disposition, meta)
+	media, err := app.media.UploadAndInsert(avatarFilename, avatarContentType, contentID, linkedModel, linkedID, null.IntFrom(user.ID), avatar, int(avatar.Size()), disposition, meta)
 	if err != nil {
 		app.lo.Error("error uploading file", "user_id", user.ID, "error", err)
 		return envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.errorUploadingFile"), nil)
 	}
 
-	// Delete current avatar.
-	if user.AvatarURL.Valid {
-		fileName := filepath.Base(user.AvatarURL.String)
-		if err := app.media.Delete(fileName); err != nil {
-			app.lo.Error("error deleting user avatar", "user_id", user.ID, "error", err)
-		}
-	}
-
 	if err := app.user.UpdateAvatar(user.ID, "/uploads/"+media.UUID); err != nil {
+		// The new object is already linked to the user and therefore will not be
+		// collected as an unlinked upload. Remove it explicitly on rollback.
+		if cleanupErr := app.media.Delete(media.UUID); cleanupErr != nil {
+			app.lo.Error("error rolling back new user avatar", "user_id", user.ID, "media_uuid", media.UUID, "error", cleanupErr)
+		}
 		return sendErrorEnvelope(r, err)
 	}
 	app.user.InvalidateAgentCache(user.ID)
+
+	// Delete the previous object only after the database points at the new one.
+	if user.AvatarURL.Valid {
+		if err := deleteOwnedUserAvatarMedia(app, user.ID, user.AvatarURL.String); err != nil {
+			app.lo.Error("error deleting previous user avatar", "user_id", user.ID, "error", err)
+		}
+	}
 	return nil
+}
+
+// prepareUserAvatar converts an untrusted multipart upload into the canonical
+// bytes persisted by uploadUserAvatar. Client filenames, MIME headers, image
+// metadata, and the original compressed representation are intentionally not
+// retained.
+func prepareUserAvatar(fileHeader *multipart.FileHeader) (*bytes.Reader, error) {
+	if fileHeader == nil || fileHeader.Size <= 0 {
+		return nil, errAvatarInvalid
+	}
+	if fileHeader.Size > maxAvatarSizeBytes {
+		return nil, errAvatarTooLarge
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return nil, fmt.Errorf("open avatar upload: %w", err)
+	}
+	defer file.Close()
+
+	avatar, err := image.CreateAvatar(io.LimitReader(file, maxAvatarSizeBytes+1))
+	if err != nil {
+		if errors.Is(err, image.ErrImageDecoderBusy) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", errAvatarInvalid, err)
+	}
+	if avatar.Size() <= 0 {
+		return nil, errAvatarInvalid
+	}
+	return avatar, nil
 }
 
 // handleGenerateAPIKey generates a new API key for a user

@@ -1,8 +1,8 @@
 <template>
-  <a :href="announcement.url" target="_blank" rel="noopener noreferrer" class="block no-underline">
+  <a :href="safeUrl" target="_blank" rel="noopener noreferrer" class="block no-underline">
     <Card class="overflow-hidden hover:bg-accent transition-colors cursor-pointer rounded-md">
       <img
-        :src="announcement.image_url"
+        :src="safeImageUrl"
         :alt="announcement.title"
         class="w-full h-auto"
       />
@@ -17,12 +17,17 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import { Card, CardContent } from '@shared-ui/components/ui/card'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 
-defineProps({
+const props = defineProps({
   announcement: {
     type: Object,
     required: true
   }
 })
+
+const safeUrl = computed(() => sanitizeHttpUrl(props.announcement.url) || '#')
+const safeImageUrl = computed(() => sanitizeHttpUrl(props.announcement.image_url))
 </script>

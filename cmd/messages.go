@@ -3,10 +3,12 @@ package main
 import (
 	"strings"
 
+	"github.com/abhinavxd/libredesk/internal/attachment"
 	amodels "github.com/abhinavxd/libredesk/internal/auth/models"
 	authzModels "github.com/abhinavxd/libredesk/internal/authz/models"
 	cmodels "github.com/abhinavxd/libredesk/internal/conversation/models"
 	"github.com/abhinavxd/libredesk/internal/envelope"
+	mediamanager "github.com/abhinavxd/libredesk/internal/media"
 	umodels "github.com/abhinavxd/libredesk/internal/user/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
@@ -68,8 +70,7 @@ func handleGetMessages(r *fastglue.Request) error {
 		total = messages[i].Total
 		// Populate attachment URLs
 		for j := range messages[i].Attachments {
-			att := messages[i].Attachments[j]
-			messages[i].Attachments[j].URL = app.media.GetURL(att.UUID, att.ContentType, att.Name)
+			app.media.DecorateAttachment(&messages[i].Attachments[j])
 		}
 		resolveQuotedCIDs(app, &messages[i])
 		resolveAttachmentCIDs(&messages[i], rootURL)
@@ -78,12 +79,10 @@ func handleGetMessages(r *fastglue.Request) error {
 	// Process CSAT status for all messages (will only affect CSAT messages)
 	app.conversation.ProcessCSATStatus(messages)
 
-	// Strip CSAT UUID from agent sessions to prevent self-rating.
-	if r.RequestCtx.UserValue("auth_method") != "api_key" {
-		for i := range messages {
-			if messages[i].HasCSAT() {
-				messages[i].StripCSATUUID()
-			}
+	// No agent credential, including API keys, may obtain the public survey token.
+	for i := range messages {
+		if messages[i].HasCSAT() {
+			messages[i].StripCSATUUID()
 		}
 	}
 
@@ -129,15 +128,14 @@ func handleGetMessage(r *fastglue.Request) error {
 	app.conversation.ProcessCSATStatus(messages)
 	message = messages[0]
 
-	// Strip CSAT UUID from agent sessions to prevent self-rating.
-	if r.RequestCtx.UserValue("auth_method") != "api_key" && message.HasCSAT() {
+	// No agent credential, including API keys, may obtain the public survey token.
+	if message.HasCSAT() {
 		message.StripCSATUUID()
 	}
 
 	rootURL, _ := app.setting.GetAppRootURL()
 	for j := range message.Attachments {
-		att := message.Attachments[j]
-		message.Attachments[j].URL = app.media.GetURL(att.UUID, att.ContentType, att.Name)
+		app.media.DecorateAttachment(&message.Attachments[j])
 	}
 	resolveQuotedCIDs(app, &message)
 	resolveAttachmentCIDs(&message, rootURL)
@@ -188,6 +186,9 @@ func handleSendMessage(r *fastglue.Request) error {
 		cuuid = r.RequestCtx.UserValue("cuuid").(string)
 		req   = messageReq{}
 	)
+	if err := validateAgentWriteBodySize(r.RequestCtx.PostBody(), app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	user, err := app.user.GetAgentCachedOrLoad(auser.ID)
 	if err != nil {
@@ -203,6 +204,9 @@ func handleSendMessage(r *fastglue.Request) error {
 	if err := r.Decode(&req, "json"); err != nil {
 		app.lo.Error("error unmarshalling message request", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
+	}
+	if err := validateMessageRequest(&req, app); err != nil {
+		return sendErrorEnvelope(r, err)
 	}
 
 	// Make sure the inbox is enabled.
@@ -223,21 +227,14 @@ func handleSendMessage(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.badRequest"), nil, envelope.InputError)
 	}
 
-	// Check if user has permission to send messages as contact
+	// Check if user has permission to send messages as contact.
 	if req.SenderType == umodels.UserTypeContact {
-		parts := strings.Split(authzModels.PermMessagesWriteAsContact, ":")
-		if len(parts) != 2 {
-			app.lo.Error("error parsing permission string", "permission", authzModels.PermMessagesWriteAsContact)
-			return sendErrorEnvelope(r, envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
+		if err := enforceAgentPermission(app, user, authzModels.PermMessagesWriteAsContact); err != nil {
+			return sendErrorEnvelope(r, err)
 		}
-		ok, err := app.authz.Enforce(user, parts[0], parts[1])
-		if err != nil {
-			app.lo.Error("error checking permission", "error", err)
-			return sendErrorEnvelope(r, envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
-		}
-		if !ok {
-			return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("status.deniedPermission"), nil, envelope.PermissionError)
-		}
+	}
+	if err := checkAgentWriteRateLimit(app, user.ID); err != nil {
+		return sendErrorEnvelope(r, err)
 	}
 
 	// Get media for all attachments, skip any already associated with a model.
@@ -284,18 +281,45 @@ func handleSendMessage(r *fastglue.Request) error {
 	return r.SendEnvelope(message)
 }
 
+func enforceAgentPermission(app *App, user umodels.User, permission string) error {
+	parts := strings.Split(permission, ":")
+	if len(parts) != 2 {
+		app.lo.Error("error parsing permission string", "permission", permission)
+		return envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	allowed, err := app.authz.Enforce(user, parts[0], parts[1])
+	if err != nil {
+		app.lo.Error("error checking permission", "permission", permission, "error", err)
+		return envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	if !allowed {
+		return envelope.NewError(envelope.PermissionError, app.i18n.T("status.deniedPermission"), nil)
+	}
+	return nil
+}
+
 // resolveAttachmentCIDs replaces inline image cid: references in email message content
 // with actual attachment URLs and resolves relative /uploads/ paths to absolute URLs.
 func resolveAttachmentCIDs(msg *cmodels.Message, rootURL string) {
 	for _, att := range msg.Attachments {
-		if att.ContentID != "" && att.URL != "" {
-			msg.Content = strings.ReplaceAll(msg.Content, "cid:"+att.ContentID, att.URL)
+		if replacement := safeAttachmentCIDURL(att); att.ContentID != "" && replacement != "" {
+			msg.Content = strings.ReplaceAll(msg.Content, "cid:"+att.ContentID, replacement)
 		}
 	}
 	if rootURL != "" {
 		msg.Content = strings.ReplaceAll(msg.Content, `src="/uploads/`, `src="`+rootURL+`/uploads/`)
 		msg.Content = strings.ReplaceAll(msg.Content, `src='/uploads/`, `src='`+rootURL+`/uploads/`)
 	}
+}
+
+func safeAttachmentCIDURL(att attachment.Attachment) string {
+	if att.ThumbnailURL != "" {
+		return att.ThumbnailURL
+	}
+	if safeInlineMediaType(att.ContentType) && strings.HasPrefix(strings.ToLower(att.ContentType), "image/") {
+		return att.URL
+	}
+	return ""
 }
 
 // resolveQuotedCIDs replaces cid: refs to media on other messages with signed URLs.
@@ -306,7 +330,16 @@ func resolveQuotedCIDs(app *App, msg *cmodels.Message) {
 		return
 	}
 	for _, ref := range refs {
-		url := app.media.GetURL(ref.UUID, ref.ContentType, ref.Filename)
-		msg.Content = strings.ReplaceAll(msg.Content, "cid:"+ref.ContentID, url)
+		previewURL, _, thumbnailURL := app.media.GetAttachmentURLs(ref.UUID, ref.ContentType, ref.Filename)
+		replacement := thumbnailURL
+		if !mediamanager.ThumbnailAvailable(ref.Meta, ref.ContentType) {
+			replacement = ""
+		}
+		if replacement == "" && safeInlineMediaType(ref.ContentType) && strings.HasPrefix(strings.ToLower(ref.ContentType), "image/") {
+			replacement = previewURL
+		}
+		if replacement != "" {
+			msg.Content = strings.ReplaceAll(msg.Content, "cid:"+ref.ContentID, replacement)
+		}
 	}
 }

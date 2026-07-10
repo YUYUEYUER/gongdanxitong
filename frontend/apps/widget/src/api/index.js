@@ -1,17 +1,23 @@
 import axios from 'axios'
+import { postToParent } from '../parentBridge.js'
 
 let _sessionToken = ''
 let _visitorToken = ''
 
-function postToParent (data) {
-    if (window.parent && window.parent !== window) {
-        window.parent.postMessage(data, '*')
-    }
-}
-
 function getInboxIDFromQuery () {
     const params = new URLSearchParams(window.location.search)
     return params.get('inbox_id') || null
+}
+
+function getParentOriginFromQuery () {
+    const params = new URLSearchParams(window.location.search)
+    const raw = params.get('parent_origin') || ''
+    try {
+        const parsed = new URL(raw)
+        return ['http:', 'https:'].includes(parsed.protocol) ? parsed.origin : ''
+    } catch {
+        return ''
+    }
 }
 
 export function setApiSessionToken (token) {
@@ -20,7 +26,6 @@ export function setApiSessionToken (token) {
 
 export function setVisitorToken (token) {
     _visitorToken = token
-    postToParent({ type: 'STORE_VISITOR_TOKEN', token })
 }
 
 export function clearVisitorToken () {
@@ -61,7 +66,6 @@ export function saveSession (sessionToken, user, userStore, isNewVisitor = false
     setApiSessionToken(sessionToken)
     if (user) userStore.setUserMeta(user)
     if (isNewVisitor) setVisitorToken(sessionToken)
-    postToParent({ type: 'STORE_SESSION', token: sessionToken })
 }
 
 // Returns visitor token if current user is a verified contact (for merge).
@@ -75,7 +79,8 @@ function getVisitorTokenForMerge () {
 
 const http = axios.create({
     timeout: 10000,
-    responseType: 'json'
+    responseType: 'json',
+    withCredentials: true
 })
 
 // Set content type and authentication headers
@@ -87,6 +92,7 @@ http.interceptors.request.use((request) => {
     // Add authentication headers for widget API endpoints
     if (request.url && request.url.includes('/api/v1/widget/')) {
         const inboxId = getInboxIDFromQuery()
+        const parentOrigin = getParentOriginFromQuery()
 
         if (_sessionToken) {
             request.headers['Authorization'] = `Bearer ${_sessionToken}`
@@ -94,6 +100,10 @@ http.interceptors.request.use((request) => {
 
         if (inboxId) {
             request.headers['X-Libredesk-Inbox-ID'] = inboxId.toString()
+        }
+
+        if (parentOrigin) {
+            request.headers['X-Libredesk-Parent-Origin'] = parentOrigin
         }
 
         const visitorTokenForMerge = getVisitorTokenForMerge()
@@ -132,6 +142,7 @@ const getLanguage = (lang) => http.get(`/api/v1/lang/${lang}`)
 const getAvailableLanguages = () => http.get('/api/v1/lang')
 const exchangeJWTForSession = (jwt) => http.post('/api/v1/widget/chat/auth/exchange', { jwt })
 const getAuthMe = () => http.get('/api/v1/widget/chat/auth/me')
+const logout = () => http.post('/api/v1/widget/chat/auth/logout', {})
 const initChatConversation = (data) => http.post('/api/v1/widget/chat/conversations/init', data)
 const getChatConversations = () => http.get('/api/v1/widget/chat/conversations')
 const getChatConversation = (uuid) => http.get(`/api/v1/widget/chat/conversations/${uuid}`)
@@ -161,6 +172,7 @@ export default {
     getAvailableLanguages,
     exchangeJWTForSession,
     getAuthMe,
+    logout,
     initChatConversation,
     getChatConversations,
     getChatConversation,

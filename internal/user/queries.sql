@@ -29,7 +29,9 @@ SELECT
     u.created_at,
     u.updated_at,
     u.email,
-    u.password,
+	u.password,
+	u.session_version,
+	u.portal_registered,
     u.type,
     u.enabled,
     u.avatar_url,
@@ -69,7 +71,12 @@ LIMIT 1;
 
 -- name: set-user-password
 UPDATE users
-SET password = $1, updated_at = now()
+SET password = $1,
+    session_version = session_version + 1,
+    api_key = NULL,
+    api_secret = NULL,
+    api_key_last_used_at = NULL,
+    updated_at = now()
 WHERE id = $2;
 
 -- name: update-agent
@@ -93,6 +100,14 @@ SET first_name = COALESCE($2, first_name),
  email = COALESCE($4, email),
  avatar_url = COALESCE($6, avatar_url), 
  password = COALESCE($7, password),
+ session_version = CASE
+   WHEN $7 IS NOT NULL OR ($8 IS NOT NULL AND enabled IS DISTINCT FROM $8)
+   THEN session_version + 1 ELSE session_version END,
+ api_key = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE api_key END,
+ api_secret = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE api_secret END,
+ api_key_last_used_at = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE api_key_last_used_at END,
+ reset_password_token = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE reset_password_token END,
+ reset_password_token_expiry = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE reset_password_token_expiry END,
  enabled = COALESCE($8, enabled),
  availability_status = COALESCE($9, availability_status),
  updated_at = now()
@@ -100,13 +115,13 @@ WHERE id = $1;
 
 -- name: update-custom-attributes
 UPDATE users
-SET custom_attributes = $2,
+SET custom_attributes = $2::jsonb - 'portal_registered',
 updated_at = now()
 WHERE id = $1;
 
 -- name: upsert-custom-attributes
 UPDATE users
-SET custom_attributes = COALESCE(custom_attributes, '{}'::jsonb) || $2,
+SET custom_attributes = (COALESCE(custom_attributes, '{}'::jsonb) - 'portal_registered') || ($2::jsonb - 'portal_registered'),
 updated_at = now()
 WHERE id = $1;
 
@@ -145,14 +160,100 @@ SELECT availability_status FROM users WHERE id = $1;
 
 -- name: set-reset-password-token
 UPDATE users
-SET reset_password_token = $2, reset_password_token_expiry = now() + interval '1 day'
+SET reset_password_token = $2, reset_password_token_expiry = now() + interval '1 hour'
 WHERE id = $1 AND type IN ('agent', 'contact');
+
+-- name: get-reset-password-user-id
+SELECT id FROM users
+WHERE reset_password_token = $1
+  AND type = $2::user_type
+  AND reset_password_token_expiry > now()
+LIMIT 1;
 
 -- name: set-password
 UPDATE users
-SET password = $1, reset_password_token = NULL, reset_password_token_expiry = NULL
-WHERE reset_password_token = $2 AND reset_password_token_expiry > now()
+SET password = $1,
+    reset_password_token = NULL,
+    reset_password_token_expiry = NULL,
+    session_version = session_version + 1,
+    api_key = NULL,
+    api_secret = NULL,
+    api_key_last_used_at = NULL,
+    updated_at = now()
+WHERE reset_password_token = $2
+  AND type = $3::user_type
+  AND reset_password_token_expiry > now()
 RETURNING id;
+
+-- name: delete-expired-customer-registrations
+DELETE FROM customer_portal_registrations WHERE expires_at <= now();
+
+-- name: is-customer-portal-registered-by-email
+SELECT EXISTS (
+    SELECT 1 FROM users
+    WHERE lower(email) = lower($1)
+      AND type = 'contact'
+      AND deleted_at IS NULL
+      AND portal_registered = true
+);
+
+-- name: upsert-customer-portal-registration
+INSERT INTO customer_portal_registrations
+    (email, first_name, last_name, token_hash, expires_at)
+VALUES ($1, $2, $3, $4, now() + interval '30 minutes')
+ON CONFLICT (email) DO UPDATE SET
+    first_name = EXCLUDED.first_name,
+    last_name = EXCLUDED.last_name,
+    token_hash = EXCLUDED.token_hash,
+    expires_at = EXCLUDED.expires_at,
+    updated_at = now();
+
+-- name: get-customer-registration-for-update
+SELECT id, email, first_name, last_name
+FROM customer_portal_registrations
+WHERE token_hash = $1 AND expires_at > now()
+FOR UPDATE;
+
+-- name: get-portal-user-for-update
+SELECT
+	id,
+	type,
+	enabled,
+	portal_registered
+FROM users
+WHERE lower(email) = lower($1)
+  AND type IN ('contact', 'visitor')
+  AND deleted_at IS NULL
+ORDER BY (type = 'contact') DESC, (external_user_id IS NULL) DESC, id ASC
+LIMIT 1
+FOR UPDATE;
+
+-- name: activate-existing-portal-user
+UPDATE users
+SET type = 'contact',
+    first_name = COALESCE(NULLIF(first_name, ''), $2),
+	last_name = COALESCE(NULLIF(last_name, ''), $3),
+	password = $4,
+	portal_registered = true,
+	custom_attributes = COALESCE(custom_attributes, '{}'::jsonb) - 'portal_registered',
+    session_version = session_version + 1,
+    api_key = NULL,
+    api_secret = NULL,
+    api_key_last_used_at = NULL,
+    updated_at = now()
+WHERE id = $1
+	AND enabled = true
+	AND deleted_at IS NULL
+	AND portal_registered = false
+RETURNING id;
+
+-- name: insert-portal-user
+INSERT INTO users (email, type, first_name, last_name, password, portal_registered)
+VALUES ($1, 'contact', $2, $3, $4, true)
+RETURNING id;
+
+-- name: delete-customer-registration
+DELETE FROM customer_portal_registrations WHERE id = $1;
 
 -- name: insert-agent
 WITH inserted_user AS (
@@ -170,7 +271,10 @@ RETURNING user_id;
 INSERT INTO users (email, type, first_name, last_name, "password", avatar_url, external_user_id, custom_attributes)
 VALUES ($1, 'contact', $2, $3, $4, $5, $6, $7)
 ON CONFLICT (external_user_id) WHERE type = 'contact' AND deleted_at IS NULL AND external_user_id IS NOT NULL
-DO UPDATE SET email = COALESCE(NULLIF(EXCLUDED.email, ''), users.email),
+DO UPDATE SET email = CASE
+				WHEN users.portal_registered THEN users.email
+				ELSE COALESCE(NULLIF(EXCLUDED.email, ''), users.email)
+			  END,
               first_name = COALESCE(NULLIF(EXCLUDED.first_name, ''), users.first_name),
               last_name = COALESCE(NULLIF(EXCLUDED.last_name, ''), users.last_name),
               updated_at = now()
@@ -189,6 +293,28 @@ RETURNING id;
 SELECT id, external_user_id FROM users
 WHERE email = $1 AND type = 'contact' AND deleted_at IS NULL
 ORDER BY (external_user_id IS NOT NULL) DESC, id ASC LIMIT 1;
+
+-- name: get-registered-portal-contact-by-email
+SELECT
+    id,
+    email,
+	password,
+	session_version,
+	portal_registered,
+    type,
+    enabled,
+    avatar_url,
+    first_name,
+    last_name,
+    external_user_id,
+    custom_attributes
+FROM users
+WHERE lower(email) = lower($1)
+	AND type = 'contact'
+	AND deleted_at IS NULL
+	AND portal_registered = true
+ORDER BY (external_user_id IS NULL) DESC, id ASC
+LIMIT 1;
 
 -- name: get-contact-by-email-without-ext-id
 SELECT id FROM users
@@ -218,14 +344,21 @@ WHERE id = $1;
 
 -- name: toggle-enable
 UPDATE users
-SET enabled = $3, updated_at = NOW()
+SET enabled = $3,
+	session_version = CASE WHEN enabled IS DISTINCT FROM $3 THEN session_version + 1 ELSE session_version END,
+	api_key = CASE WHEN $3 = false THEN NULL ELSE api_key END,
+	api_secret = CASE WHEN $3 = false THEN NULL ELSE api_secret END,
+	api_key_last_used_at = CASE WHEN $3 = false THEN NULL ELSE api_key_last_used_at END,
+	reset_password_token = CASE WHEN $3 = false THEN NULL ELSE reset_password_token END,
+	reset_password_token_expiry = CASE WHEN $3 = false THEN NULL ELSE reset_password_token_expiry END,
+	updated_at = NOW()
 WHERE id = $1 AND type = $2;
 
 -- name: update-contact
 UPDATE users
 SET first_name = COALESCE($2, first_name),
     last_name = COALESCE($3, last_name),
-    email = COALESCE($4, email),
+	email = CASE WHEN portal_registered THEN email ELSE COALESCE($4, email) END,
     avatar_url = $5,
     phone_number = $6,
     phone_number_country_code = $7,
@@ -237,7 +370,7 @@ WHERE id = $1 and type in ('contact', 'visitor');
 UPDATE users
 SET first_name = COALESCE(NULLIF($2, ''), first_name),
     last_name = COALESCE(NULLIF($3, ''), last_name),
-    email = COALESCE(NULLIF($4, ''), email),
+	email = CASE WHEN portal_registered THEN email ELSE COALESCE(NULLIF($4, ''), email) END,
     updated_at = now()
 WHERE id = $1 AND type IN ('contact', 'visitor');
 
@@ -288,6 +421,7 @@ SELECT
     u.updated_at,
     u.email,
     u.password,
+	u.session_version,
     u.type,
     u.enabled,
     u.avatar_url,
@@ -341,6 +475,7 @@ SELECT
     u.updated_at,
     u.email,
     u.password,
+	u.session_version,
     u.type,
     u.enabled,
     u.avatar_url,
@@ -382,47 +517,56 @@ LIMIT 1;
 UPDATE users SET type = 'contact', updated_at = now()
 WHERE id = $1 AND type = 'visitor';
 
--- name: merge-visitor-to-contact
-WITH transfer_conversations AS (
-    UPDATE conversations
-    SET contact_id = $2, updated_at = now()
-    WHERE contact_id = $1
-    RETURNING id
-),
-transfer_messages AS (
-    UPDATE conversation_messages
-    SET sender_id = $2
-    WHERE conversation_id IN (SELECT id FROM transfer_conversations) AND sender_id = $1
-    RETURNING id
-),
-transfer_participants AS (
-    UPDATE conversation_participants
-    SET user_id = $2
-    WHERE user_id = $1 AND NOT EXISTS (
-        SELECT 1 FROM conversation_participants WHERE user_id = $2 AND conversation_id = conversation_participants.conversation_id
-    )
-    RETURNING id
-),
-delete_remaining_participants AS (
-    DELETE FROM conversation_participants
-    WHERE user_id = $1
-    RETURNING id
-),
-transfer_notes AS (
-    UPDATE contact_notes
-    SET contact_id = $2
-    WHERE contact_id = $1
-    RETURNING id
-),
-delete_visitor AS (
-    DELETE FROM users
-    WHERE id = $1 AND type = 'visitor'
-    RETURNING id
-)
-SELECT
-    (SELECT COUNT(*) FROM transfer_conversations) as conversations_transferred,
-    (SELECT COUNT(*) FROM transfer_messages) as messages_transferred,
-    (SELECT COUNT(*) FROM delete_visitor) as visitor_deleted;
+-- name: transfer-visitor-conversations
+UPDATE conversations
+SET contact_id = $2, updated_at = now()
+WHERE contact_id = $1;
+
+-- name: transfer-visitor-messages
+UPDATE conversation_messages
+SET sender_id = $2
+WHERE sender_id = $1;
+
+-- name: delete-duplicate-visitor-participants
+DELETE FROM conversation_participants visitor_participant
+WHERE visitor_participant.user_id = $1
+  AND EXISTS (
+	SELECT 1
+	FROM conversation_participants contact_participant
+	WHERE contact_participant.user_id = $2
+	  AND contact_participant.conversation_id = visitor_participant.conversation_id
+  );
+
+-- name: transfer-visitor-participants
+UPDATE conversation_participants
+SET user_id = $2
+WHERE user_id = $1;
+
+-- name: transfer-visitor-notes
+UPDATE contact_notes
+SET contact_id = $2
+WHERE contact_id = $1;
+
+-- name: transfer-visitor-media
+UPDATE media
+SET owner_user_id = $2, updated_at = now()
+WHERE owner_user_id = $1;
+
+-- name: delete-merged-visitor
+DELETE FROM users
+WHERE id = $1 AND type = 'visitor';
+
+-- name: lock-users-for-merge
+SELECT id, type
+FROM users
+WHERE id = ANY($1::bigint[]) AND deleted_at IS NULL
+ORDER BY id
+FOR UPDATE;
+
+-- name: get-merge-media-usage
+SELECT COUNT(*), COALESCE(SUM(COALESCE(size, 0)), 0)
+FROM media
+WHERE owner_user_id = ANY($1::bigint[]);
 
 -- name: get-user-ids-by-role
 SELECT user_id FROM user_roles WHERE role_id = $1;

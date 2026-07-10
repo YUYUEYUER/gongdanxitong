@@ -13,6 +13,7 @@ FRONTEND_DIST := ${FRONTEND_DIR}/dist
 STATIC := ${FRONTEND_DIST} i18n schema.sql static
 GOPATH ?= $(HOME)/go
 STUFFBIN ?= $(GOPATH)/bin/stuffbin
+STUFFBIN_VERSION ?= v1.3.0
 
 # The default target to run when `make` is executed.
 .DEFAULT_GOAL := build 
@@ -20,13 +21,13 @@ STUFFBIN ?= $(GOPATH)/bin/stuffbin
 # Install stuffbin if it doesn't exist.
 $(STUFFBIN):
 	@echo "→ Installing stuffbin..."
-	@go install github.com/knadh/stuffbin/...
+	@go install github.com/knadh/stuffbin/...@$(STUFFBIN_VERSION)
 
 # Install dependencies for both backend and frontend.
 .PHONY: install-deps
 install-deps: $(STUFFBIN)
 	@echo "→ Installing frontend dependencies..."
-	@cd ${FRONTEND_DIR} && pnpm install
+	@cd ${FRONTEND_DIR} && pnpm install --frozen-lockfile
 
 # Build the frontend for production (both apps).
 .PHONY: frontend-build
@@ -57,7 +58,7 @@ run-backend:
 .PHONY: run-frontend
 run-frontend:
 	@echo "→ Installing frontend dependencies (if not already installed)..."
-	@cd ${FRONTEND_DIR} && pnpm install
+	@cd ${FRONTEND_DIR} && pnpm install --frozen-lockfile
 	@echo "→ Running main frontend app..."
 	@export VITE_APP_VERSION="${VERSION}" && cd ${FRONTEND_DIR} && pnpm dev:main
 
@@ -65,7 +66,7 @@ run-frontend:
 .PHONY: run-frontend-main
 run-frontend-main:
 	@echo "→ Installing frontend dependencies (if not already installed)..."
-	@cd ${FRONTEND_DIR} && pnpm install
+	@cd ${FRONTEND_DIR} && pnpm install --frozen-lockfile
 	@echo "→ Running main frontend app..."
 	@export VITE_APP_VERSION="${VERSION}" && cd ${FRONTEND_DIR} && pnpm dev:main
 
@@ -73,7 +74,7 @@ run-frontend-main:
 .PHONY: run-frontend-widget
 run-frontend-widget:
 	@echo "→ Installing frontend dependencies (if not already installed)..."
-	@cd ${FRONTEND_DIR} && pnpm install
+	@cd ${FRONTEND_DIR} && pnpm install --frozen-lockfile
 	@echo "→ Running widget frontend app..."
 	@export VITE_APP_VERSION="${VERSION}" && cd ${FRONTEND_DIR} && pnpm dev:widget
 
@@ -108,4 +109,4 @@ test:
 	@echo "→ Running Go tests..."
 	go test -count=1 ./...
 	@echo "→ Running frontend tests..."
-	cd ${FRONTEND_DIR} && npx pnpm install --frozen-lockfile && npx pnpm test:run
+	cd ${FRONTEND_DIR} && pnpm install --frozen-lockfile && pnpm test:run

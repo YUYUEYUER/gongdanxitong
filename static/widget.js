@@ -19,6 +19,17 @@
             if (!config.inboxID) {
                 throw new Error('inboxID is required');
             }
+            if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(config.inboxID))) {
+                throw new Error('inboxID is invalid');
+            }
+
+            const parsedBaseURL = new URL(config.baseURL, window.location.href);
+            if (parsedBaseURL.protocol !== 'http:' && parsedBaseURL.protocol !== 'https:') {
+                throw new Error('baseURL must use HTTP or HTTPS');
+            }
+            if (parsedBaseURL.username || parsedBaseURL.password || parsedBaseURL.search || parsedBaseURL.hash) {
+                throw new Error('baseURL must not contain credentials, query parameters, or fragments');
+            }
 
             this.IFRAME_BORDER_RADIUS = '16px';
             this.IFRAME_BOX_SHADOW = '0 12px 48px rgba(0,0,0,0.35), 0 4px 16px rgba(0,0,0,0.25)';
@@ -30,6 +41,14 @@
             this.MOBILE_LAUNCHER_SIZE = 50;
 
             this.config = config;
+            this.baseURL = parsedBaseURL.href.replace(/\/$/, '');
+            this.widgetOrigin = parsedBaseURL.origin;
+            this.channelNonce = this.generateChannelNonce();
+            this.channelReady = false;
+            this._channelInitTimer = null;
+            this._channelInitAttempts = 0;
+            this._logoutRequest = null;
+            this._pendingMessages = [];
             this.iframe = null;
             this.toggleButton = null;
             this.widgetButtonWrapper = null;
@@ -49,9 +68,72 @@
             this.init();
         }
 
+        generateChannelNonce () {
+            if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+                throw new Error('Secure browser randomness is required');
+            }
+            const bytes = new Uint8Array(24);
+            window.crypto.getRandomValues(bytes);
+            return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+        }
+
+        channelEnvelope (data) {
+            return Object.assign({}, data, {
+                bridge: 'libredesk-widget-bridge',
+                version: 1,
+                channelNonce: this.channelNonce
+            });
+        }
+
+        postChannelInit () {
+            if (!this.iframe || !this.iframe.contentWindow) return;
+            this.iframe.contentWindow.postMessage(this.channelEnvelope({
+                type: 'WIDGET_CHANNEL_INIT'
+            }), this.widgetOrigin);
+        }
+
+        startChannelHandshake () {
+            this.stopChannelHandshake();
+            this._channelInitAttempts = 0;
+
+            const attempt = () => {
+                if (this.channelReady || !this.iframe || !this.iframe.contentWindow) {
+                    this.stopChannelHandshake();
+                    return;
+                }
+                this.postChannelInit();
+                this._channelInitAttempts += 1;
+                if (this._channelInitAttempts >= 80) {
+                    this.stopChannelHandshake();
+                    return;
+                }
+                this._channelInitTimer = setTimeout(attempt, 250);
+            };
+
+            attempt();
+        }
+
+        stopChannelHandshake () {
+            if (this._channelInitTimer !== null) {
+                clearTimeout(this._channelInitTimer);
+                this._channelInitTimer = null;
+            }
+        }
+
         postToIframe (data) {
-            if (this.iframe && this.iframe.contentWindow) {
-                this.iframe.contentWindow.postMessage(data, '*');
+            if (!this.iframe || !this.iframe.contentWindow) return;
+            if (!this.channelReady) {
+                if (this._pendingMessages.length >= 100) this._pendingMessages.shift();
+                this._pendingMessages.push(data);
+                return;
+            }
+            this.iframe.contentWindow.postMessage(this.channelEnvelope(data), this.widgetOrigin);
+        }
+
+        flushPendingMessages () {
+            while (this.channelReady && this._pendingMessages.length > 0) {
+                const data = this._pendingMessages.shift();
+                this.iframe.contentWindow.postMessage(this.channelEnvelope(data), this.widgetOrigin);
             }
         }
 
@@ -63,53 +145,29 @@
             return 'libredesk-' + type + '-' + this.config.inboxID;
         }
 
-        getCookieDomain () {
-            if (this.config.cookieDomain) return this.config.cookieDomain;
-            if (this._cookieDomain !== undefined) return this._cookieDomain;
-            var hostname = window.location.hostname;
-            if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) || hostname === 'localhost') {
-                this._cookieDomain = '';
-                return '';
-            }
-            var parts = hostname.split('.');
-            for (var i = parts.length - 1; i >= 0; i--) {
-                var domain = '.' + parts.slice(i).join('.');
-                document.cookie = '__ld_test__=1;domain=' + domain + ';path=/';
-                if (document.cookie.indexOf('__ld_test__') !== -1) {
-                    document.cookie = '__ld_test__=;domain=' + domain + ';path=/;max-age=0';
-                    this._cookieDomain = domain;
-                    return domain;
+        getLegacyCookieDomains () {
+            const domains = new Set();
+            const hostname = window.location.hostname.toLowerCase();
+            if (this.config.cookieDomain) domains.add(String(this.config.cookieDomain).trim());
+            if (hostname !== 'localhost' && !/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) {
+                const parts = hostname.split('.');
+                for (let i = 0; i < parts.length - 1; i++) {
+                    domains.add('.' + parts.slice(i).join('.'));
                 }
             }
-            this._cookieDomain = '';
-            return '';
+            return Array.from(domains).filter(Boolean);
         }
 
-        setCookie (name, value) {
-            var domain = this.getCookieDomain();
-            var maxAge = 365 * 24 * 60 * 60;
-            var cookie = name + '=' + encodeURIComponent(value) + ';path=/;max-age=' + maxAge + ';SameSite=Lax';
-            if (domain) {
-                cookie += ';domain=' + domain;
-            }
-            if (window.location.protocol === 'https:') {
-                cookie += ';Secure';
-            }
-            document.cookie = cookie;
-        }
-
-        getCookie (name) {
-            var match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
-            return match ? decodeURIComponent(match[1]) : null;
+        clearLegacyDomainCookies (name) {
+            this.getLegacyCookieDomains().forEach((domain) => {
+                document.cookie = name + '=;domain=' + domain + ';path=/;max-age=0;SameSite=Lax';
+            });
         }
 
         deleteCookie (name) {
-            var domain = this.getCookieDomain();
             var cookie = name + '=;path=/;max-age=0;SameSite=Lax';
-            if (domain) {
-                cookie += ';domain=' + domain;
-            }
             document.cookie = cookie;
+            this.clearLegacyDomainCookies(name);
         }
 
         async init () {
@@ -124,7 +182,9 @@
                 this.setLauncherPosition();
                 this.widgetButtonWrapper.style.display = 'none';
                 this.iframe.addEventListener('load', () => {
-                    this.sendMobileState();
+                    this.channelReady = false;
+                    this._pendingMessages = [];
+                    this.startChannelHandshake();
                 });
                 this.setupMobileDetection();
                 this.setupEventListeners();
@@ -136,7 +196,13 @@
 
         async fetchWidgetSettings () {
             try {
-                const response = await fetch(`${this.config.baseURL}/api/v1/widget/chat/settings/launcher?inbox_id=${this.config.inboxID}`);
+                const settingsURL = new URL(`${this.baseURL}/api/v1/widget/chat/settings/launcher`);
+                settingsURL.searchParams.set('inbox_id', this.config.inboxID);
+                settingsURL.searchParams.set('parent_origin', window.location.origin);
+                const response = await fetch(settingsURL.href, {
+                    credentials: 'omit',
+                    referrerPolicy: 'no-referrer'
+                });
 
                 if (!response.ok) {
                     throw new Error(`Error fetching widget settings. Status: ${response.status}`);
@@ -165,6 +231,18 @@
                 return L > 0.179 ? '#000000' : '#ffffff';
             } catch (e) {
                 return '#ffffff';
+            }
+        }
+
+        safeHTTPURL (value) {
+            if (!value) return '';
+            try {
+                const parsed = new URL(value, window.location.href);
+                if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+                if (parsed.username || parsed.password) return '';
+                return parsed.href;
+            } catch (_) {
+                return '';
             }
         }
 
@@ -199,7 +277,7 @@
             `;
 
             this.defaultIcon = document.createElement('img');
-            this.defaultIcon.src = launcher.logo_url || DEFAULT_LAUNCHER_LOGO;
+            this.defaultIcon.src = this.safeHTTPURL(launcher.logo_url) || DEFAULT_LAUNCHER_LOGO;
             this.defaultIcon.style.cssText = `
                 width: 100%;
                 height: 100%;
@@ -271,7 +349,13 @@
                 : 'width 0.3s ease, height 0.3s ease, bottom 0.3s ease, border-radius 0.3s ease, box-shadow 0.3s ease';
 
             this.iframe = document.createElement('iframe');
-            this.iframe.src = `${this.config.baseURL}/widget?inbox_id=${this.config.inboxID}`;
+            const iframeURL = new URL(`${this.baseURL}/widget`);
+            iframeURL.searchParams.set('inbox_id', this.config.inboxID);
+            iframeURL.searchParams.set('parent_origin', window.location.origin);
+            iframeURL.hash = 'ld_channel=' + encodeURIComponent(this.channelNonce);
+            this.iframe.src = iframeURL.href;
+            this.iframe.referrerPolicy = 'strict-origin';
+            this.iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads');
             this.iframe.style.cssText = `
                 position: fixed;
                 border: none;
@@ -310,11 +394,26 @@
         }
 
         sendPageInfo () {
+            const url = this.getSanitizedPageURL();
+            if (!url) return;
             this.postToIframe({
                 type: 'PAGE_VISIT',
-                url: window.location.href,
-                title: document.title || ''
+                url: url,
+                title: ''
             });
+        }
+
+        getSanitizedPageURL () {
+            try {
+                const current = new URL(window.location.href);
+                if (current.protocol !== 'http:' && current.protocol !== 'https:') return '';
+                // Paths, titles, queries, and fragments all commonly contain
+                // account identifiers or one-time secrets. The default signal
+                // is intentionally limited to the embedding origin.
+                return new URL('/', current.origin).href;
+            } catch (_) {
+                return '';
+            }
         }
 
         setLauncherPosition () {
@@ -370,10 +469,15 @@
         }
 
         handleMessage (event) {
-            if (event.source !== this.iframe.contentWindow) return;
+            if (!this.iframe || event.source !== this.iframe.contentWindow) return;
+            if (event.origin !== this.widgetOrigin || !this.isValidIframeMessage(event.data)) return;
+            if (event.data.channelNonce !== this.channelNonce) return;
 
             switch (event.data.type) {
-                case 'VUE_APP_READY':
+                case 'WIDGET_CHANNEL_READY':
+                    this.channelReady = true;
+                    this.stopChannelHandshake();
+                    this.flushPendingMessages();
                     this.handleVueAppReady();
                     break;
                 case 'CLOSE_WIDGET':
@@ -394,18 +498,47 @@
                 case 'REQUEST_PAGE_INFO':
                     this.sendPageInfo();
                     break;
-                case 'STORE_SESSION':
-                    this.setCookie(this.getCookieName('session'), event.data.token);
-                    break;
-                case 'STORE_VISITOR_TOKEN':
-                    this.setCookie(this.getCookieName('visitor'), event.data.token);
-                    break;
                 case 'CLEAR_VISITOR_TOKEN':
                     this.deleteCookie(this.getCookieName('visitor'));
                     break;
                 case 'CLEAR_SESSION_TOKEN':
                     this.deleteCookie(this.getCookieName('session'));
                     break;
+                case 'SESSION_CLEARED':
+                    this.deleteCookie(this.getCookieName('session'));
+                    this.deleteCookie(this.getCookieName('visitor'));
+                    this.settleLogout(true);
+                    break;
+                case 'SESSION_CLEAR_FAILED':
+                    console.error('Libredesk logout failed; the session was not revoked.');
+                    this.settleLogout(false);
+                    break;
+            }
+        }
+
+        isValidIframeMessage (data) {
+            if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+            if (data.bridge !== 'libredesk-widget-bridge' || data.version !== 1) return false;
+            if (typeof data.channelNonce !== 'string' || data.channelNonce.length > 128) return false;
+            const keys = Object.keys(data);
+            const only = (allowed) => keys.every((key) => allowed.indexOf(key) !== -1);
+            const base = ['bridge', 'version', 'channelNonce', 'type'];
+            switch (data.type) {
+                case 'WIDGET_CHANNEL_READY':
+                case 'CLOSE_WIDGET':
+                case 'WIDGET_LOADED':
+                case 'EXPAND_WIDGET':
+                case 'COLLAPSE_WIDGET':
+                case 'REQUEST_PAGE_INFO':
+                case 'CLEAR_VISITOR_TOKEN':
+                case 'CLEAR_SESSION_TOKEN':
+                case 'SESSION_CLEARED':
+                case 'SESSION_CLEAR_FAILED':
+                    return only(base);
+                case 'UPDATE_UNREAD_COUNT':
+                    return only(base.concat('count')) && Number.isSafeInteger(data.count) && data.count >= 0 && data.count <= 999999;
+                default:
+                    return false;
             }
         }
 
@@ -431,23 +564,21 @@
         handleVueAppReady () {
             this.sendMobileState();
 
-            var visitorToken = this.getCookie(this.getCookieName('visitor'));
+            // Legacy parent-domain cookies are untrusted and all tokens from
+            // that generation are invalid. Delete them without ever reading or
+            // forwarding their values into the isolated widget frame.
+            this.deleteCookie(this.getCookieName('session'));
+            this.deleteCookie(this.getCookieName('visitor'));
 
             if (this.config.userJWT) {
                 this.postToIframe({
                     type: 'SET_JWT_TOKEN',
-                    jwt: this.config.userJWT,
-                    visitorToken: visitorToken || ''
+                    jwt: this.config.userJWT
                 });
                 return;
             }
 
-            var sessionToken = this.getCookie(this.getCookieName('session'));
-            this.postToIframe({
-                type: 'SESSION_DATA',
-                sessionToken: sessionToken || '',
-                visitorToken: visitorToken || ''
-            });
+            this.postToIframe({ type: 'SESSION_DATA' });
         }
 
         handleWidgetLoaded () {
@@ -538,7 +669,8 @@
 
             const self = this;
             const onPageChange = () => {
-                const url = window.location.href;
+                const url = self.getSanitizedPageURL();
+                if (!url) return;
                 if (url === self._lastPageURL) return;
                 self._lastPageURL = url;
                 // Defer to let SPA frameworks update document.title after route change.
@@ -576,13 +708,31 @@
         }
 
         logout () {
-            this.deleteCookie(this.getCookieName('session'));
-            this.deleteCookie(this.getCookieName('visitor'));
+            if (this._logoutRequest) return this._logoutRequest.promise;
+
+            var resolveRequest;
+            var promise = new Promise((resolve) => { resolveRequest = resolve; });
+            var timer = setTimeout(() => {
+                console.error('Libredesk logout timed out; the session may still be active.');
+                this.settleLogout(false);
+            }, 10000);
+            this._logoutRequest = { promise: promise, resolve: resolveRequest, timer: timer };
             this.postToIframe({ type: 'CLEAR_SESSION' });
+            return promise;
+        }
+
+        settleLogout (success) {
+            if (!this._logoutRequest) return;
+            var request = this._logoutRequest;
+            this._logoutRequest = null;
+            clearTimeout(request.timer);
+            request.resolve(success);
         }
 
         destroy () {
             this.stopPageTracking();
+            this.stopChannelHandshake();
+            this.settleLogout(false);
             window.removeEventListener('message', this._boundHandleMessage);
             window.removeEventListener('resize', this._boundHandleResize);
             window.removeEventListener('orientationchange', this._boundHandleResize);
@@ -600,6 +750,8 @@
             this._onShowCallback = null;
             this._onHideCallback = null;
             this._onUnreadCountChangeCallback = null;
+            this.channelReady = false;
+            this._pendingMessages = [];
         }
     }
 

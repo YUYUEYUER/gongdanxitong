@@ -8,11 +8,13 @@ import (
 	"sync"
 	"time"
 
-	realip "github.com/ferluci/fast-realip"
-
+	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/httputil"
 	"github.com/abhinavxd/libredesk/internal/inbox/channel/livechat"
+	imodels "github.com/abhinavxd/libredesk/internal/inbox/models"
+	umodels "github.com/abhinavxd/libredesk/internal/user/models"
 	"github.com/fasthttp/websocket"
+	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
 
@@ -29,7 +31,9 @@ const (
 	maxPageVisits           = 20
 	pageVisitTTL            = 24 * time.Hour
 	wsReadDeadline          = 20 * time.Second
+	wsJoinDeadline          = 10 * time.Second
 	wsReadLimitBytes        = 64 * 1024
+	wsMaxFramesPerMinute    = 120
 
 	// Per-connection minimum intervals between inbound frames of each kind.
 	// The HTTP upgrade is rate-limited, but inbound frames aren't, so a single
@@ -67,8 +71,25 @@ type safeConn struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
 
-	rateMu sync.Mutex
-	lastAt map[string]time.Time
+	rateMu           sync.Mutex
+	lastAt           map[string]time.Time
+	frameWindowStart time.Time
+	frameCount       int
+}
+
+func (sc *safeConn) allowFrame() bool {
+	sc.rateMu.Lock()
+	defer sc.rateMu.Unlock()
+	now := time.Now()
+	if sc.frameWindowStart.IsZero() || now.Sub(sc.frameWindowStart) >= time.Minute {
+		sc.frameWindowStart = now
+		sc.frameCount = 0
+	}
+	if sc.frameCount >= wsMaxFramesPerMinute {
+		return false
+	}
+	sc.frameCount++
+	return true
 }
 
 func (sc *safeConn) WriteJSON(v any) error {
@@ -98,20 +119,41 @@ func (sc *safeConn) allow(kind string, minInterval time.Duration) bool {
 	return true
 }
 
+func isAllowedBeforeWidgetJoin(messageType string) bool {
+	return messageType == WidgetMsgTypeJoin
+}
+
 func handleWidgetWS(r *fastglue.Request) error {
 	var app = r.Context.(*App)
+	validatedInbox, err := getWidgetInbox(r)
+	if err != nil {
+		return err
+	}
+	parentOrigin, err := getWidgetParentOrigin(r)
+	if err != nil {
+		return err
+	}
 
-	clientIP := realip.FromRequest(r.RequestCtx)
+	clientIP := app.rateLimit.ClientIP(r.RequestCtx)
+	requestHost := string(r.RequestCtx.Host())
+	releaseConnection, allowed := widgetActiveConnections.acquire(validatedInbox.UUID, clientIP)
+	if !allowed {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.RateLimitError)
+	}
+	defer releaseConnection()
 
 	if err := widgetUpgrader.Upgrade(r.RequestCtx, func(conn *websocket.Conn) {
 		conn.SetReadLimit(wsReadLimitBytes)
 		sc := &safeConn{conn: conn}
 
 		var (
-			client   *livechat.Client
-			liveChat *livechat.LiveChat
-			inboxUUID string
-			userID    int
+			client                *livechat.Client
+			liveChat              *livechat.LiveChat
+			inboxUUID             string
+			userID                int
+			sessionToken          string
+			joinAttempted         bool
+			lastSessionValidation time.Time
 		)
 
 		defer func() {
@@ -122,34 +164,55 @@ func handleWidgetWS(r *fastglue.Request) error {
 			}
 		}()
 
+		joinBy := time.Now().Add(wsJoinDeadline)
+	connectionLoop:
 		for {
-			conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+			if userID == 0 {
+				conn.SetReadDeadline(joinBy)
+			} else {
+				conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+			}
 			var msg WidgetMessage
 			if err := conn.ReadJSON(&msg); err != nil {
 				app.lo.Debug("widget websocket connection closed", "error", err)
 				break
 			}
+			if !sc.allowFrame() {
+				sendWidgetError(sc, "Message rate limit exceeded")
+				break
+			}
+			if userID == 0 && !isAllowedBeforeWidgetJoin(msg.Type) {
+				sendWidgetError(sc, "Authentication required")
+				break
+			}
+			if userID > 0 && time.Since(lastSessionValidation) >= 15*time.Second {
+				if err := revalidateWidgetWebSocketSession(app, sessionToken, userID, validatedInbox.UUID, parentOrigin, requestHost, clientIP); err != nil {
+					app.lo.Info("closing widget websocket after session revocation", "user_id", userID)
+					break
+				}
+				lastSessionValidation = time.Now()
+			}
 
 			switch msg.Type {
 			case WidgetMsgTypeJoin:
-				// Clean up previous client on re-join.
-				if client != nil && liveChat != nil {
-					liveChat.RemoveClient(client)
-					client.CloseChannel()
-					client = nil
-					liveChat = nil
+				if joinAttempted {
+					sendWidgetError(sc, "Inbox already joined")
+					break connectionLoop
 				}
+				joinAttempted = true
 
-				joinedClient, joinedLiveChat, joinedInboxUUID, joinedUserID, err := handleInboxJoin(app, sc, msg.Data, msg.Token, clientIP)
+				joinedClient, joinedLiveChat, joinedInboxUUID, joinedUserID, err := handleInboxJoin(app, sc, msg.Data, msg.Token, clientIP, validatedInbox, parentOrigin)
 				if err != nil {
 					app.lo.Error("error handling widget join", "error", err)
 					sendWidgetError(sc, "Failed to join conversation")
-					continue
+					break connectionLoop
 				}
 				client = joinedClient
 				liveChat = joinedLiveChat
 				inboxUUID = joinedInboxUUID
 				userID = joinedUserID
+				sessionToken = msg.Token
+				lastSessionValidation = time.Now()
 
 			case WidgetMsgTypeTyping:
 				if userID == 0 || inboxUUID == "" {
@@ -189,15 +252,45 @@ func handleWidgetWS(r *fastglue.Request) error {
 	return nil
 }
 
-func handleInboxJoin(app *App, sc *safeConn, data json.RawMessage, token, clientIP string) (*livechat.Client, *livechat.LiveChat, string, int, error) {
+func revalidateWidgetWebSocketSession(app *App, token string, expectedUserID int, inboxUUID, parentOrigin, requestHost, clientIP string) error {
+	inbox, err := app.inbox.GetDBRecord(inboxUUID)
+	if err != nil || !inbox.Enabled || inbox.Channel != livechat.ChannelLiveChat {
+		return fmt.Errorf("widget inbox is no longer active")
+	}
+	var config livechat.Config
+	if err := json.Unmarshal(inbox.Config, &config); err != nil {
+		return fmt.Errorf("widget inbox configuration is invalid")
+	}
+	trustedDomains := config.TrustedDomains
+	if len(trustedDomains) == 0 {
+		trustedDomains = []string{requestHost}
+	}
+	if !httputil.IsOriginTrusted(parentOrigin, trustedDomains) {
+		return fmt.Errorf("widget parent origin is no longer trusted")
+	}
+	if len(config.BlockedIPs) > 0 && httputil.IsIPBlocked(clientIP, config.BlockedIPs) {
+		return fmt.Errorf("widget client IP is blocked")
+	}
+
+	session, err := loadSession(app, token, inbox, config, parentOrigin)
+	if err != nil || session.UserID != expectedUserID {
+		return fmt.Errorf("widget session is no longer active")
+	}
+	user, err := app.user.Get(session.UserID, "", []string{umodels.UserTypeContact, umodels.UserTypeVisitor})
+	if err != nil || !user.Enabled || user.SessionVersion != session.UserSessionVersion {
+		return fmt.Errorf("widget user session is no longer active")
+	}
+	return nil
+}
+
+func handleInboxJoin(app *App, sc *safeConn, data json.RawMessage, token, clientIP string, inbox imodels.Inbox, parentOrigin string) (*livechat.Client, *livechat.LiveChat, string, int, error) {
 	var joinData WidgetInboxJoinRequest
 	if err := json.Unmarshal(data, &joinData); err != nil {
 		return nil, nil, "", 0, fmt.Errorf("invalid join data: %w", err)
 	}
 
-	inbox, err := app.inbox.GetDBRecord(joinData.InboxID)
-	if err != nil {
-		return nil, nil, "", 0, fmt.Errorf("inbox not found: %w", err)
+	if joinData.InboxID != inbox.UUID {
+		return nil, nil, "", 0, fmt.Errorf("inbox does not match validated widget origin")
 	}
 	if !inbox.Enabled {
 		return nil, nil, "", 0, fmt.Errorf("inbox is not enabled")
@@ -210,7 +303,7 @@ func handleInboxJoin(app *App, sc *safeConn, data json.RawMessage, token, client
 		}
 	}
 
-	session, err := loadSession(app, token, config)
+	session, err := loadSession(app, token, inbox, config, parentOrigin)
 	if err != nil {
 		return nil, nil, "", 0, fmt.Errorf("session token validation failed: %w", err)
 	}
@@ -219,8 +312,8 @@ func handleInboxJoin(app *App, sc *safeConn, data json.RawMessage, token, client
 	}
 
 	// Verify user exists and is enabled.
-	user, err := app.user.Get(session.UserID, "", []string{})
-	if err != nil || !user.Enabled {
+	user, err := app.user.Get(session.UserID, "", []string{umodels.UserTypeContact, umodels.UserTypeVisitor})
+	if err != nil || !user.Enabled || user.SessionVersion != session.UserSessionVersion {
 		return nil, nil, "", 0, fmt.Errorf("user not found or disabled")
 	}
 
@@ -239,6 +332,20 @@ func handleInboxJoin(app *App, sc *safeConn, data json.RawMessage, token, client
 	if err != nil {
 		return nil, nil, "", 0, fmt.Errorf("adding client to live chat: %w", err)
 	}
+	joinSucceeded := false
+	defer func() {
+		if !joinSucceeded {
+			liveChat.RemoveClient(client)
+			client.CloseChannel()
+		}
+	}()
+
+	if err := sc.WriteJSON(WidgetMessage{
+		Type: WidgetMsgTypeJoined,
+		Data: json.RawMessage(`{"message":"namaste!"}`),
+	}); err != nil {
+		return nil, nil, "", 0, err
+	}
 
 	go func() {
 		defer func() {
@@ -254,15 +361,9 @@ func handleInboxJoin(app *App, sc *safeConn, data json.RawMessage, token, client
 		}
 	}()
 
-	if err := sc.WriteJSON(WidgetMessage{
-		Type: WidgetMsgTypeJoined,
-		Data: json.RawMessage(`{"message":"namaste!"}`),
-	}); err != nil {
-		return nil, nil, "", 0, err
-	}
-
 	app.lo.Debug("widget client joined live chat", "user_id", userIDStr, "inbox_uuid", joinData.InboxID)
 
+	joinSucceeded = true
 	return client, liveChat, joinData.InboxID, user.ID, nil
 }
 
@@ -294,16 +395,7 @@ func handleWidgetPageVisit(app *App, data json.RawMessage, contactID int) {
 	if err := json.Unmarshal(data, &visit); err != nil || visit.URL == "" {
 		return
 	}
-
-	if len(visit.URL) > 2048 {
-		visit.URL = visit.URL[:2048]
-	}
-	if len(visit.Title) > 256 {
-		visit.Title = visit.Title[:256]
-	}
-
-	parsedURL, err := url.Parse(visit.URL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+	if !sanitizeWidgetPageVisit(&visit) {
 		return
 	}
 
@@ -343,6 +435,25 @@ func handleWidgetPageVisit(app *App, data json.RawMessage, contactID int) {
 		}
 	}
 	app.conversation.BroadcastContactUpdate(contactID, map[string]any{"page_visits": pages})
+}
+
+func sanitizeWidgetPageVisit(visit *WidgetPageVisitData) bool {
+	if visit == nil || visit.URL == "" || len(visit.URL) > 2048 {
+		return false
+	}
+	parsedURL, err := url.Parse(visit.URL)
+	if err != nil || parsedURL.Hostname() == "" || parsedURL.User != nil ||
+		(parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return false
+	}
+	parsedURL.Path = "/"
+	parsedURL.RawPath = ""
+	parsedURL.RawQuery = ""
+	parsedURL.ForceQuery = false
+	parsedURL.Fragment = ""
+	visit.URL = parsedURL.String()
+	visit.Title = ""
+	return true
 }
 
 func getPageVisitsFromRedis(app *App, contactID int) []map[string]string {

@@ -44,6 +44,12 @@ const routes = [
         meta: { titleKey: 'auth.signInButton' }
       },
       {
+        path: 'portal/verify-email',
+        name: 'customer-verify-email',
+        component: () => import('@main/views/customer/CustomerVerifyEmailView.vue'),
+        meta: { titleKey: 'auth.signInButton' }
+      },
+      {
         path: 'portal/forgot-password',
         name: 'customer-forgot-password',
         component: () => import('@main/views/customer/CustomerForgotPasswordView.vue'),

@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/abhinavxd/libredesk/internal/conversation/models"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
+	"github.com/abhinavxd/ssrfguard"
 )
 
 const (
@@ -70,7 +73,13 @@ func (e *Email) sendWithResend(m models.OutboundMessage) error {
 	req.Header.Set("Authorization", "Bearer "+e.resendCfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := e.resendHTTPClient
+	if client == nil {
+		client, err = newResendHTTPClient(apiURL)
+		if err != nil {
+			return fmt.Errorf("invalid Resend API URL: %w", err)
+		}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("sending resend request: %w", err)
@@ -87,6 +96,43 @@ func (e *Email) sendWithResend(m models.OutboundMessage) error {
 		return fmt.Errorf("resend API error (%d): %s", resp.StatusCode, resendErr.Message)
 	}
 	return fmt.Errorf("resend API error (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+}
+
+func newResendHTTPClient(rawURL string) (*http.Client, error) {
+	if strings.TrimSpace(rawURL) == "" {
+		rawURL = defaultResendAPIURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing URL: %w", err)
+	}
+	if parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+		return nil, fmt.Errorf("Resend API URL must be an HTTPS URL without user info")
+	}
+
+	guard := ssrfguard.New()
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   guard.Control,
+		}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("redirect to non-HTTPS URL is not allowed")
+			}
+			return nil
+		},
+	}, nil
 }
 
 func (e *Email) buildResendPayload(m models.OutboundMessage) (resendEmailPayload, error) {

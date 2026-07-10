@@ -1,11 +1,12 @@
 package user
 
 import (
-	"encoding/json"
+	"database/sql"
 	"errors"
 	"strings"
 
 	"github.com/abhinavxd/libredesk/internal/envelope"
+	"github.com/abhinavxd/libredesk/internal/stringutil"
 	"github.com/abhinavxd/libredesk/internal/user/models"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -13,32 +14,19 @@ import (
 const customerPortalRegisteredKey = "portal_registered"
 
 func IsCustomerPortalRegistered(user models.User) bool {
-	if len(user.CustomAttributes) == 0 {
-		return false
-	}
-
-	var attrs map[string]any
-	if err := json.Unmarshal(user.CustomAttributes, &attrs); err != nil {
-		return false
-	}
-
-	registered, _ := attrs[customerPortalRegisteredKey].(bool)
-	return registered
+	return user.PortalRegistered
 }
 
 func (u *Manager) VerifyContactPassword(email string, password []byte) (models.User, error) {
 	var user models.User
 
-	user, err := u.Get(0, strings.TrimSpace(strings.ToLower(email)), []string{models.UserTypeContact})
+	user, err := u.GetRegisteredPortalContactByEmail(email)
 	if err != nil {
 		if envErr, ok := err.(envelope.Error); ok && envErr.ErrorType == envelope.NotFoundError {
+			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, password)
 			return user, envelope.NewError(envelope.InputError, u.i18n.T("user.invalidEmailPassword"), nil)
 		}
 		return user, err
-	}
-
-	if !IsCustomerPortalRegistered(user) {
-		return user, envelope.NewError(envelope.InputError, u.i18n.T("user.invalidEmailPassword"), nil)
 	}
 
 	if err := u.verifyPassword(password, user.Password.String); err != nil {
@@ -48,95 +36,141 @@ func (u *Manager) VerifyContactPassword(email string, password []byte) (models.U
 	return user, nil
 }
 
-func (u *Manager) RegisterCustomerContact(firstName, lastName, email, password string) (models.User, error) {
+type pendingCustomerRegistration struct {
+	ID        int    `db:"id"`
+	Email     string `db:"email"`
+	FirstName string `db:"first_name"`
+	LastName  string `db:"last_name"`
+}
+
+type portalUserState struct {
+	ID               int    `db:"id"`
+	Type             string `db:"type"`
+	Enabled          bool   `db:"enabled"`
+	PortalRegistered bool   `db:"portal_registered"`
+}
+
+// BeginCustomerPortalRegistration records a short-lived registration request.
+// It deliberately does not mutate users or expose whether the email exists.
+func (u *Manager) BeginCustomerPortalRegistration(firstName, lastName, email string) (string, error) {
 	email = strings.TrimSpace(strings.ToLower(email))
 	firstName = strings.TrimSpace(firstName)
 	lastName = strings.TrimSpace(lastName)
 
-	if !IsStrongPassword(password) {
-		return models.User{}, envelope.NewError(envelope.InputError, PasswordHint, nil)
-	}
-
 	blocked, err := u.IsEmailBlocked(email)
 	if err != nil {
-		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
-	}
-	if blocked {
-		return models.User{}, envelope.NewError(envelope.PermissionError, u.i18n.T("user.accountDisabled"), nil)
+		return "", envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 
+	var alreadyRegistered bool
+	if err := u.q.IsCustomerPortalRegisteredByEmail.Get(&alreadyRegistered, email); err != nil {
+		u.lo.Error("error checking portal registration state", "error", err)
+		return "", envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	if blocked || alreadyRegistered {
+		return "", nil
+	}
+
+	token, err := stringutil.RandomAlphanumeric(48)
+	if err != nil {
+		u.lo.Error("error generating customer registration token", "error", err)
+		return "", envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	if _, err := u.q.DeleteExpiredCustomerRegistrations.Exec(); err != nil {
+		u.lo.Warn("error cleaning expired customer registrations", "error", err)
+	}
+	if _, err := u.q.UpsertCustomerPortalRegistration.Exec(
+		email,
+		firstName,
+		lastName,
+		securityTokenHash(token),
+	); err != nil {
+		u.lo.Error("error storing customer registration", "error", err)
+		return "", envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	return token, nil
+}
+
+// VerifyCustomerPortalRegistration atomically consumes a verification token
+// and only then creates or activates the customer portal account.
+func (u *Manager) VerifyCustomerPortalRegistration(token, password string) (models.User, error) {
+	tokenHash := securityTokenHash(strings.TrimSpace(token))
+	if tokenHash == "" || !IsStrongPassword(password) {
+		return models.User{}, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
+	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		u.lo.Error("error hashing portal contact password", "error", err)
+		u.lo.Error("error hashing verified portal contact password", "error", err)
 		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 
-	var user models.User
+	tx, err := u.db.Beginx()
+	if err != nil {
+		u.lo.Error("error beginning customer registration transaction", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	defer tx.Rollback()
 
-	user, err = u.GetContactByEmail(email)
+	var pending pendingCustomerRegistration
+	if err := tx.Stmtx(u.q.GetCustomerRegistrationForUpdate).Get(&pending, tokenHash); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return models.User{}, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
+		}
+		u.lo.Error("error loading customer registration", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+
+	var (
+		state  portalUserState
+		userID int
+	)
+	err = tx.Stmtx(u.q.GetPortalUserForUpdate).Get(&state, pending.Email)
 	switch {
 	case err == nil:
-		if IsCustomerPortalRegistered(user) {
-			return models.User{}, envelope.NewError(envelope.ConflictError, u.i18n.T("customerAuth.emailAlreadyRegistered"), nil)
+		if !state.Enabled || state.PortalRegistered {
+			return models.User{}, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
 		}
-	case !isNotFoundError(err):
-		return models.User{}, err
-	default:
-		visitor, visitorErr := u.GetVisitorByEmail(email)
-		if visitorErr == nil {
-			if upgradeErr := u.UpgradeVisitorToContact(visitor.ID); upgradeErr != nil {
-				return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
-			}
-			user, err = u.Get(visitor.ID, "", []string{models.UserTypeContact})
-			if err != nil {
-				return models.User{}, err
-			}
-		} else if !isNotFoundError(visitorErr) {
-			return models.User{}, visitorErr
-		}
-	}
-
-	return u.upsertPortalContactUser(user, firstName, lastName, email, string(passwordHash))
-}
-
-func (u *Manager) upsertPortalContactUser(existing models.User, firstName, lastName, email, passwordHash string) (models.User, error) {
-	var (
-		user = existing
-		err  error
-	)
-
-	if user.ID == 0 {
-		user = models.User{
-			FirstName: firstName,
-			LastName:  lastName,
-		}
-		user.Email.String = email
-		user.Email.Valid = email != ""
-		if err := u.CreateContact(&user); err != nil {
+		if err := tx.Stmtx(u.q.ActivateExistingPortalUser).Get(
+			&userID,
+			state.ID,
+			pending.FirstName,
+			pending.LastName,
+			string(passwordHash),
+		); err != nil {
+			u.lo.Error("error activating customer portal account", "error", err)
 			return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 		}
-	}
-
-	if err := u.UpdateContactBasicInfo(user.ID, firstName, lastName, email); err != nil {
+	case errors.Is(err, sql.ErrNoRows):
+		if err := tx.Stmtx(u.q.InsertPortalUser).Get(
+			&userID,
+			pending.Email,
+			pending.FirstName,
+			pending.LastName,
+			string(passwordHash),
+		); err != nil {
+			u.lo.Error("error creating verified customer portal account", "error", err)
+			return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+		}
+	default:
+		u.lo.Error("error checking customer portal account", "error", err)
 		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 
-	if _, err = u.q.SetUserPassword.Exec(passwordHash, user.ID); err != nil {
-		u.lo.Error("error setting portal contact password", "contact_id", user.ID, "error", err)
+	result, err := tx.Stmtx(u.q.DeleteCustomerRegistration).Exec(pending.ID)
+	if err != nil {
+		u.lo.Error("error consuming customer registration token", "error", err)
+		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return models.User{}, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
+	}
+
+	if err := tx.Commit(); err != nil {
+		u.lo.Error("error committing customer registration", "error", err)
 		return models.User{}, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 
-	if err := u.SaveCustomAttributes(user.ID, map[string]any{customerPortalRegisteredKey: true}, false); err != nil {
-		return models.User{}, err
-	}
-
-	return u.Get(user.ID, "", []string{models.UserTypeContact})
-}
-
-func isNotFoundError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var envErr envelope.Error
-	return errors.As(err, &envErr) && envErr.ErrorType == envelope.NotFoundError
+	return u.Get(userID, "", []string{models.UserTypeContact})
 }

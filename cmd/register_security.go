@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/abhinavxd/libredesk/internal/envelope"
-	usersvc "github.com/abhinavxd/libredesk/internal/user"
+	"github.com/abhinavxd/libredesk/internal/stringutil"
 	"github.com/valyala/fasthttp"
 )
 
@@ -62,11 +63,11 @@ func validateCustomerRegisterFields(app *App, req customerRegisterRequest) error
 	if req.FirstName == "" {
 		return envelope.NewError(envelope.InputError, app.i18n.T("publicTicket.nameRequired"), nil)
 	}
-	if req.Email == "" || !strings.Contains(req.Email, "@") {
+	if req.Email == "" || !stringutil.ValidEmail(req.Email) || utf8.RuneCountInString(req.Email) > 320 {
 		return envelope.NewError(envelope.InputError, app.i18n.T("validation.invalidEmail"), nil)
 	}
-	if !usersvc.IsStrongPassword(req.Password) {
-		return envelope.NewError(envelope.InputError, usersvc.PasswordHint, nil)
+	if utf8.RuneCountInString(req.FirstName) > 140 || utf8.RuneCountInString(req.LastName) > 140 {
+		return envelope.NewError(envelope.InputError, app.i18n.T("globals.messages.badRequest"), nil)
 	}
 	return nil
 }
@@ -97,7 +98,12 @@ func checkCustomerRegisterRateLimit(ctx context.Context, app *App, ip, userAgent
 		result, err := app.rateLimit.CheckWindow(ctx, key, window, maxAttempts)
 		if err != nil {
 			app.lo.Warn("register rate limit check failed", "subject", subject.kind, "error", err)
-			continue
+			return envelope.NewErrorWithCode(
+				envelope.GeneralError,
+				fasthttp.StatusServiceUnavailable,
+				app.i18n.T("globals.messages.somethingWentWrong"),
+				nil,
+			)
 		}
 		if result.Allowed {
 			continue

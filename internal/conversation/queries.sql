@@ -737,7 +737,12 @@ SELECT
                 'uuid', media.uuid,
                 'size', media.size,
                 'content_id', media.content_id,
-                'disposition', media.disposition
+                'disposition', media.disposition,
+                'thumbnail_available', CASE
+                    WHEN media.meta ? 'thumbnail_size' AND (media.meta->>'thumbnail_size') ~ '^[0-9]{1,10}$'
+                        THEN (media.meta->>'thumbnail_size')::bigint > 0
+                    ELSE media.content_type IN ('image/png', 'image/jpeg', 'image/gif')
+                END
             ) ORDER BY media.filename
         ) FILTER (WHERE media.id IS NOT NULL),
         '[]'::json
@@ -786,7 +791,12 @@ SELECT
          'uuid', uuid,
          'size', size,
          'content_id', content_id,
-         'disposition', disposition
+         'disposition', disposition,
+         'thumbnail_available', CASE
+           WHEN meta ? 'thumbnail_size' AND (meta->>'thumbnail_size') ~ '^[0-9]{1,10}$'
+             THEN (meta->>'thumbnail_size')::bigint > 0
+           ELSE content_type IN ('image/png', 'image/jpeg', 'image/gif')
+         END
        ) ORDER BY filename
      ) FROM media
      WHERE model_type = 'messages' AND model_id = m.id),

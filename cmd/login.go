@@ -6,7 +6,6 @@ import (
 	amodels "github.com/abhinavxd/libredesk/internal/auth/models"
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	turnstilesvc "github.com/abhinavxd/libredesk/internal/turnstile"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
@@ -31,9 +30,15 @@ func (req loginRequest) turnstileResponse() string {
 func handleLogin(r *fastglue.Request) error {
 	var (
 		app      = r.Context.(*App)
-		ip       = realip.FromRequest(r.RequestCtx)
+		ip       = requestClientIP(app, r.RequestCtx)
 		loginReq loginRequest
 	)
+	if err := requireJSONPost(r.RequestCtx, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := validateCSRFCookie(r, app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	// Decode JSON request.
 	if err := r.Decode(&loginReq, "json"); err != nil {
@@ -69,11 +74,12 @@ func handleLogin(r *fastglue.Request) error {
 	}
 
 	if err := app.auth.SaveSession(amodels.User{
-		ID:        user.ID,
-		Email:     user.Email.String,
-		FirstName: user.FirstName,
-		LastName:  user.LastName,
-		Type:      user.Type,
+		ID:             user.ID,
+		Email:          user.Email.String,
+		FirstName:      user.FirstName,
+		LastName:       user.LastName,
+		Type:           user.Type,
+		SessionVersion: user.SessionVersion,
 	}, r); err != nil {
 		app.lo.Error("error saving session", "error", err)
 		return sendErrorEnvelope(r, envelope.NewError(envelope.GeneralError, app.i18n.T("globals.messages.somethingWentWrong"), nil))
@@ -104,7 +110,7 @@ func handleLogout(r *fastglue.Request) error {
 	var (
 		app   = r.Context.(*App)
 		auser = r.RequestCtx.UserValue("user").(amodels.User)
-		ip    = realip.FromRequest(r.RequestCtx)
+		ip    = requestClientIP(app, r.RequestCtx)
 	)
 
 	// Insert activity log.

@@ -26,17 +26,31 @@ session_lifetime = "9h"
 # Request read and write timeouts.
 read_timeout = "5s"
 write_timeout = "5s"
-# Maximum request body size in bytes (100MB)
+# Maximum request body size in bytes (32MB). This leaves headroom for the
+# default 20MB multipart upload limit without allowing oversized JSON bodies.
 # If you are using proxy, you may need to configure them to allow larger request bodies.
-max_body_size = 104857600
+max_body_size = 33554432
+# Maximum concurrently served HTTP connections. Hijacked WebSocket
+# connections use their own stricter limits and are not counted here.
+concurrency = 64
 # Size of the read buffer for incoming requests (also limits max header size).
 read_buffer_size = 65536
 # Keepalive settings.
 keepalive_timeout = "10s"
+# Proxy addresses or CIDRs allowed to set X-Forwarded-For/X-Real-IP.
+# Leave empty when LibreDesk is exposed directly. Never use 0.0.0.0/0.
+trusted_proxies = []
 
 # File upload provider to use, either `fs` or `s3`.
 [upload]
 provider = "fs"
+# Instance-wide hard quota. This includes e-mail, anonymous Widget uploads,
+# linked files, unlinked files, and thumbnail storage.
+max_total_files = 100000
+max_total_size_bytes = 53687091200 # 50 GiB
+# Filesystem uploads stop before the volume drops below this free-space reserve.
+# Remote S3 capacity must also be constrained with a bucket/provider quota.
+min_free_size_bytes = 1073741824 # 1 GiB
 
 # Filesystem provider.
 [upload.fs]
@@ -169,3 +183,29 @@ requests_per_minute = 30
 # Limit how often a single IP can submit public ticket forms
 enabled = true
 requests_per_minute = 10
+
+[rate_limit.customer]
+enabled = true
+requests_per_minute = 60
+
+[rate_limit.upload]
+enabled = true
+requests_per_minute = 20
+
+[rate_limit.agent_write]
+# Per-IP burst limit. Agent/API-key writes also have a fixed per-user hourly budget.
+enabled = true
+requests_per_minute = 120
+
+[rate_limit.ai]
+enabled = true
+requests_per_minute = 10
+
+[rate_limit.ws]
+enabled = true
+requests_per_minute = 30
+
+[rate_limit.widget_upload]
+# Widget file uploads also have per-contact and per-inbox hourly/daily budgets.
+enabled = true
+requests_per_minute = 5

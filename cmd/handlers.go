@@ -19,8 +19,8 @@ const maxPageSize = 500
 // initHandlers initializes the HTTP routes and handlers for the application.
 func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	// Authentication.
-	g.POST("/api/v1/auth/login", rateLimit(handleLogin, "auth"))
-	g.POST("/api/v1/auth/logout", auth(handleLogout))
+	g.POST("/api/v1/auth/login", rateLimit(requestBodyLimit(handleLogin, maxPublicJSONBodyBytes), "auth"))
+	g.POST("/api/v1/auth/logout", auth(requestBodyLimit(handleLogout, maxPublicJSONBodyBytes)))
 	g.GET("/api/v1/oidc/{id}/login", rateLimit(handleOIDCLogin, "auth"))
 	g.GET("/api/v1/oidc/{id}/finish", rateLimit(handleOIDCCallback, "auth"))
 
@@ -32,27 +32,28 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	g.GET("/api/v1/config", handleGetConfig)
 	g.GET("/api/v1/public/tickets/config", rateLimit(handleGetPublicTicketConfig, "public"))
 	g.GET("/api/v1/public/tickets/captcha", rateLimit(handleGetPublicTicketCaptcha, "public_ticket_captcha"))
-	g.POST("/api/v1/public/tickets", rateLimit(tryCustomerAuth(handleCreatePublicTicket), "public_ticket_submit"))
+	g.POST("/api/v1/public/tickets", rateLimit(tryCustomerAuth(requestBodyLimit(handleCreatePublicTicket, maxPublicJSONBodyBytes)), "public_ticket_submit"))
 
 	// Customer portal auth.
-	g.POST("/api/v1/customer/auth/register", rateLimit(handleCustomerRegister, "auth"))
-	g.POST("/api/v1/customer/auth/login", rateLimit(handleCustomerLogin, "auth"))
-	g.POST("/api/v1/customer/auth/forgot-password", rateLimit(handleCustomerForgotPassword, "auth"))
-	g.POST("/api/v1/customer/auth/reset-password", rateLimit(handleCustomerResetPassword, "auth"))
+	g.POST("/api/v1/customer/auth/register", rateLimit(requestBodyLimit(handleCustomerRegister, maxPublicJSONBodyBytes), "auth"))
+	g.POST("/api/v1/customer/auth/verify-email", rateLimit(requestBodyLimit(handleCustomerVerifyEmail, maxPublicJSONBodyBytes), "auth"))
+	g.POST("/api/v1/customer/auth/login", rateLimit(requestBodyLimit(handleCustomerLogin, maxPublicJSONBodyBytes), "auth"))
+	g.POST("/api/v1/customer/auth/forgot-password", rateLimit(requestBodyLimit(handleCustomerForgotPassword, maxPublicJSONBodyBytes), "auth"))
+	g.POST("/api/v1/customer/auth/reset-password", rateLimit(requestBodyLimit(handleCustomerResetPassword, maxPublicJSONBodyBytes), "auth"))
 	g.GET("/api/v1/customer/auth/me", customerAuth(handleGetCurrentCustomer))
-	g.POST("/api/v1/customer/auth/logout", customerAuth(handleCustomerLogout))
+	g.POST("/api/v1/customer/auth/logout", customerAuth(requestBodyLimit(handleCustomerLogout, maxPublicJSONBodyBytes)))
 
 	// Customer portal tickets.
-	g.POST("/api/v1/customer/media", customerAuth(handleMediaUpload))
+	g.POST("/api/v1/customer/media", customerAuth(rateLimit(handleMediaUpload, "upload")))
 	g.GET("/api/v1/customer/tickets/config", customerAuth(handleCustomerTicketConfig))
 	g.GET("/api/v1/customer/tickets", customerAuth(handleCustomerListTickets))
-	g.POST("/api/v1/customer/tickets", customerAuth(handleCustomerCreateTicket))
+	g.POST("/api/v1/customer/tickets", customerAuth(rateLimit(requestBodyLimit(handleCustomerCreateTicket, maxPublicJSONBodyBytes), "customer")))
 	g.GET("/api/v1/customer/tickets/{uuid}", customerAuth(handleCustomerGetTicket))
-	g.POST("/api/v1/customer/tickets/{uuid}/messages", customerAuth(handleCustomerReplyTicket))
+	g.POST("/api/v1/customer/tickets/{uuid}/messages", customerAuth(rateLimit(requestBodyLimit(handleCustomerReplyTicket, maxPublicJSONBodyBytes), "customer")))
 
 	// Media - supports both authenticated access and signed URLs.
 	g.GET("/uploads/{uuid}", authOrSignedURL(handleServeMedia))
-	g.POST("/api/v1/media", auth(handleMediaUpload))
+	g.POST("/api/v1/media", auth(rateLimit(handleMediaUpload, "upload")))
 
 	// Settings.
 	g.GET("/api/v1/settings/general", auth(handleGetGeneralSettings))
@@ -89,15 +90,15 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	g.GET("/api/v1/conversations/{cuuid}/messages/{uuid}", perm(handleGetMessage, "messages:read"))
 	g.GET("/api/v1/conversations/{uuid}/messages", perm(handleGetMessages, "messages:read"))
 	g.GET("/api/v1/conversations/{uuid}/transcript", perm(handleDownloadConversationTranscript, "messages:read"))
-	g.POST("/api/v1/conversations/{cuuid}/messages", perm(handleSendMessage, "messages:write"))
+	g.POST("/api/v1/conversations/{cuuid}/messages", perm(rateLimit(handleSendMessage, "agent_write"), "messages:write"))
 	g.PUT("/api/v1/conversations/{cuuid}/messages/{uuid}/retry", perm(handleRetryMessage, "messages:write"))
 	g.DELETE("/api/v1/conversations/{cuuid}/messages/{uuid}", perm(handleDeleteMessage, "messages:write"))
-	g.POST("/api/v1/conversations", perm(handleCreateConversation, "conversations:write"))
-	g.PUT("/api/v1/conversations/{uuid}/custom-attributes", auth(handleUpdateConversationCustomAttributes))
-	g.PUT("/api/v1/conversations/{uuid}/contacts/custom-attributes", auth(handleUpdateContactCustomAttributes))
+	g.POST("/api/v1/conversations", perm(rateLimit(handleCreateConversation, "agent_write"), "conversations:write"))
+	g.PUT("/api/v1/conversations/{uuid}/custom-attributes", perm(rateLimit(handleUpdateConversationCustomAttributes, "agent_write"), "conversations:write"))
+	g.PUT("/api/v1/conversations/{uuid}/contacts/custom-attributes", perm(rateLimit(handleUpdateContactCustomAttributes, "agent_write"), "contacts:write"))
 	// Draft endpoints
 	g.GET("/api/v1/drafts", auth(handleGetAllDrafts))
-	g.POST("/api/v1/conversations/{uuid}/draft", auth(handleUpsertConversationDraft))
+	g.POST("/api/v1/conversations/{uuid}/draft", perm(rateLimit(handleUpsertConversationDraft, "agent_write"), "messages:write"))
 	g.DELETE("/api/v1/conversations/{uuid}/draft", auth(handleDeleteConversationDraft))
 
 	// Search.
@@ -159,8 +160,8 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	g.GET("/api/v1/agents/import/status", perm(handleGetAgentImportStatus, "users:manage"))
 	g.POST("/api/v1/agents/{id}/api-key", perm(handleGenerateAPIKey, "users:manage"))
 	g.DELETE("/api/v1/agents/{id}/api-key", perm(handleRevokeAPIKey, "users:manage"))
-	g.POST("/api/v1/agents/reset-password", rateLimit(tryAuth(handleResetPassword), "auth"))
-	g.POST("/api/v1/agents/set-password", rateLimit(tryAuth(handleSetPassword), "auth"))
+	g.POST("/api/v1/agents/reset-password", rateLimit(tryAuth(requestBodyLimit(handleResetPassword, maxPublicJSONBodyBytes)), "auth"))
+	g.POST("/api/v1/agents/set-password", rateLimit(tryAuth(requestBodyLimit(handleSetPassword, maxPublicJSONBodyBytes)), "auth"))
 
 	// Contacts.
 	g.GET("/api/v1/contacts", perm(handleGetContacts, "contacts:read_all"))
@@ -260,7 +261,7 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 
 	// AI completions.
 	g.GET("/api/v1/ai/prompts", auth(handleGetAIPrompts))
-	g.POST("/api/v1/ai/completion", auth(handleAICompletion))
+	g.POST("/api/v1/ai/completion", perm(rateLimit(handleAICompletion, "ai"), "messages:write"))
 	g.PUT("/api/v1/ai/provider", perm(handleUpdateAIProvider, "ai:manage"))
 
 	// Custom attributes.
@@ -274,7 +275,7 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	g.GET("/api/v1/activity-logs", perm(handleGetActivityLogs, "activity_logs:manage"))
 
 	// CSAT.
-	g.POST("/api/v1/csat/{uuid}/response", rateLimit(handleSubmitCSATResponse, "public"))
+	g.POST("/api/v1/csat/{uuid}/response", rateLimit(requestBodyLimit(handleSubmitCSATResponse, maxPublicJSONBodyBytes), "public"))
 
 	// User notifications.
 	g.GET("/api/v1/notifications", auth(handleGetUserNotifications))
@@ -285,30 +286,32 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	g.DELETE("/api/v1/notifications", auth(handleDeleteAllNotifications))
 
 	// WebSocket.
-	g.GET("/ws", auth(func(r *fastglue.Request) error {
+	g.GET("/ws", auth(rateLimit(func(r *fastglue.Request) error {
 		return handleWS(r, hub)
-	}))
+	}, "ws")))
 
 	// Live chat widget websocket.
-	g.GET("/widget/ws", rateLimit(handleWidgetWS, "widget"))
+	g.GET("/widget/ws", rateLimit(validateWidgetInbox(handleWidgetWS), "widget"))
 
 	// Widget APIs.
 	g.GET("/api/v1/widget/chat/settings/launcher", rateLimit(validateWidgetInbox(handleGetChatLauncherSettings), "widget"))
 	g.GET("/api/v1/widget/chat/settings", rateLimit(validateWidgetInbox(handleGetChatSettings), "widget"))
-	g.POST("/api/v1/widget/chat/auth/exchange", rateLimit(validateWidgetInbox(handleAuthExchange), "widget"))
+	g.POST("/api/v1/widget/chat/auth/exchange", rateLimit(validateWidgetInbox(requestBodyLimit(handleAuthExchange, maxPublicJSONBodyBytes)), "widget"))
+	g.POST("/api/v1/widget/chat/auth/logout", rateLimit(validateWidgetInbox(requestBodyLimit(handleWidgetLogout, maxPublicJSONBodyBytes)), "widget"))
 	g.GET("/api/v1/widget/chat/auth/me", rateLimit(widgetAuth(handleWidgetAuthMe), "widget"))
-	g.POST("/api/v1/widget/chat/conversations/init", rateLimit(widgetAuth(handleChatInit), "widget"))
+	g.POST("/api/v1/widget/chat/conversations/init", rateLimit(widgetAuth(requestBodyLimit(handleChatInit, maxPublicJSONBodyBytes)), "widget"))
 	g.GET("/api/v1/widget/chat/conversations", rateLimit(widgetAuth(handleGetConversations), "widget"))
-	g.POST("/api/v1/widget/chat/conversations/{uuid}/update-last-seen", rateLimit(widgetAuth(handleChatUpdateLastSeen), "widget"))
+	g.POST("/api/v1/widget/chat/conversations/{uuid}/update-last-seen", rateLimit(widgetAuth(requestBodyLimit(handleChatUpdateLastSeen, maxPublicJSONBodyBytes)), "widget"))
 	g.GET("/api/v1/widget/chat/conversations/{uuid}", rateLimit(widgetAuth(handleChatGetConversation), "widget"))
-	g.POST("/api/v1/widget/chat/conversations/{uuid}/message", rateLimit(widgetAuth(handleChatSendMessage), "widget"))
-	g.POST("/api/v1/widget/media/upload", rateLimit(widgetAuth(handleWidgetMediaUpload), "widget"))
+	g.POST("/api/v1/widget/chat/conversations/{uuid}/message", rateLimit(widgetAuth(requestBodyLimit(handleChatSendMessage, maxPublicJSONBodyBytes)), "widget"))
+	g.POST("/api/v1/widget/media/upload", rateLimit(widgetAuth(handleWidgetMediaUpload), "widget_upload"))
 
 	// Frontend pages.
 	g.GET("/", notAuthPage(serveIndexPage))
 	g.GET("/submit-ticket", publicTicketPage(serveIndexPage))
 	g.GET("/portal/login", customerNotAuthPage(serveIndexPage))
 	g.GET("/portal/register", customerNotAuthPage(serveIndexPage))
+	g.GET("/portal/verify-email", customerNotAuthPage(serveIndexPage))
 	g.GET("/portal/forgot-password", customerNotAuthPage(serveIndexPage))
 	g.GET("/portal/reset-password", customerNotAuthPage(serveIndexPage))
 	g.GET("/portal/tickets", customerAuthPage(serveIndexPage))
@@ -337,15 +340,17 @@ func initHandlers(g *fastglue.Fastglue, hub *ws.Hub) {
 	// Public pages.
 	g.GET("/csat/{uuid}", rateLimit(handleShowCSAT, "public"))
 	g.GET("/csat/{uuid}/widget", rateLimit(handleShowCSATWidget, "public"))
-	g.POST("/csat/{uuid}", rateLimit(handleUpdateCSATResponse, "public"))
+	g.POST("/csat/{uuid}", rateLimit(requestBodyLimit(handleUpdateCSATResponse, maxPublicJSONBodyBytes), "public"))
 
 	// Health check.
 	g.GET("/health", handleHealthCheck)
+	g.GET("/ready", handleReadinessCheck)
 }
 
 // serveIndexPage serves the main index page of the application.
 func serveIndexPage(r *fastglue.Request) error {
 	app := r.Context.(*App)
+	setMainPageSecurityHeaders(r.RequestCtx)
 
 	// Prevent caching of the index page.
 	r.RequestCtx.Response.Header.Add("Cache-Control", "no-store, no-cache, must-revalidate, post-check=0, pre-check=0")
@@ -377,11 +382,11 @@ func serveWidgetIndexPage(r *fastglue.Request) error {
 	r.RequestCtx.Response.Header.Add("Pragma", "no-cache")
 	r.RequestCtx.Response.Header.Add("Expires", "-1")
 
-	// CSP headers if trusted domains is set.
-	if config, err := getWidgetConfig(r); err == nil && len(config.TrustedDomains) > 0 {
-		csp := "frame-ancestors 'self' " + strings.Join(config.TrustedDomains, " ")
-		r.RequestCtx.Response.Header.Set("Content-Security-Policy", csp)
+	config, err := getWidgetConfig(r)
+	if err != nil {
+		return r.SendErrorEnvelope(http.StatusBadRequest, app.i18n.T("validation.notFoundInbox"), nil, envelope.InputError)
 	}
+	setWidgetPageSecurityHeaders(r.RequestCtx, config.TrustedDomains)
 
 	// Serve the index.html file from the embedded filesystem.
 	file, err := app.fs.Get(path.Join(widgetDir, "index.html"))
@@ -467,8 +472,7 @@ func serveWidgetStaticFiles(r *fastglue.Request) error {
 func serveWidgetJS(r *fastglue.Request) error {
 	app := r.Context.(*App)
 
-	r.RequestCtx.Response.Header.Set("Content-Type", "application/javascript")
-	r.RequestCtx.Response.Header.Set("Cache-Control", "no-cache")
+	setWidgetScriptHeaders(r.RequestCtx)
 
 	file, err := app.fs.Get("static/widget.js")
 	if err != nil {
@@ -507,5 +511,15 @@ func sendErrorEnvelope(r *fastglue.Request, err error) error {
 
 // handleHealthCheck handles the health check endpoint.
 func handleHealthCheck(r *fastglue.Request) error {
+	return r.SendEnvelope(true)
+}
+
+// handleReadinessCheck verifies that dependencies needed to serve requests are
+// reachable. It intentionally returns no backend details to unauthenticated callers.
+func handleReadinessCheck(r *fastglue.Request) error {
+	app := r.Context.(*App)
+	if !dependenciesReady(app) {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Service unavailable", nil, envelope.GeneralError)
+	}
 	return r.SendEnvelope(true)
 }

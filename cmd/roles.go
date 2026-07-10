@@ -7,7 +7,6 @@ import (
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/role"
 	"github.com/abhinavxd/libredesk/internal/role/models"
-	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
@@ -78,7 +77,7 @@ func handleUpdateRole(r *fastglue.Request) error {
 	var (
 		app   = r.Context.(*App)
 		auser = r.RequestCtx.UserValue("user").(amodels.User)
-		ip    = realip.FromRequest(r.RequestCtx)
+		ip    = app.rateLimit.ClientIP(r.RequestCtx)
 		id, _ = strconv.Atoi(r.RequestCtx.UserValue("id").(string))
 		req   = models.Role{}
 	)

@@ -48,24 +48,47 @@ And more — checkout [libredesk.io](https://libredesk.io) or try the [live demo
 
 ### Docker
 
-The latest image is available on DockerHub at [`libredesk/libredesk:latest`](https://hub.docker.com/r/libredesk/libredesk/tags?page=1&ordering=last_updated&name=latest)
+Production deployments must use an immutable release image reference containing both a version tag and its `sha256` manifest digest. Mutable tags such as `latest` or `main` are not supported for production upgrades.
 
 ```shell
-# Download the compose file and sample config file in the current directory.
-curl -LO https://github.com/abhinavxd/libredesk/raw/main/docker-compose.yml
-curl -LO https://github.com/abhinavxd/libredesk/raw/main/config.sample.toml
+# Download the deployment files in the current directory.
+curl -LO https://github.com/YUYUEYUER/gongdanxitong/raw/main/docker-compose.yml
+curl -LO https://github.com/YUYUEYUER/gongdanxitong/raw/main/config.sample.toml
+curl -LO https://github.com/YUYUEYUER/gongdanxitong/raw/main/.env.example
 
-# Copy the config.sample.toml to config.toml and edit it as needed.
+# Create the local configuration files.
 cp config.sample.toml config.toml
+cp .env.example .env
+
+# Set LIBREDESK_IMAGE to an immutable release reference containing both a tag
+# and @sha256 digest. Set independent random values for LIBREDESK_ENCRYPTION_KEY
+# (32 characters), POSTGRES_PASSWORD, and REDIS_PASSWORD in .env. Also set
+# app.root_url in config.toml and configure trusted proxy CIDRs when a reverse
+# proxy is used.
 
 # Run the services in the background.
+docker compose pull
 docker compose up -d
 
 # Setting System user password.
 docker exec -it libredesk_app ./libredesk --set-system-user-password
 ```
 
-Go to `http://localhost:9000` and login with username `System` and the password you set using the `--set-system-user-password` command.
+Go to `http://localhost:9000` and login with username `System` and the password you set using the `--set-system-user-password` command. Production deployments must use HTTPS. Livechat inboxes must list every embedding host in `trusted_domains`; an empty list permits same-origin embedding only.
+
+LibreDesk is currently a single-organization, single-application-replica system. Do not scale the `app` service above one process, and do not treat inboxes or teams as tenant boundaries. Use separate deployments, databases, Redis instances, encryption keys, and upload stores for mutually distrusting organizations.
+
+### Security upgrade to v2.5.2
+
+Do not run old and new binaries against the same database during this upgrade.
+
+1. Stop every old LibreDesk application instance. Keep PostgreSQL, Redis, and the upload store available.
+2. Back up PostgreSQL and the complete upload store. Verify that the backup can be restored.
+3. Pin `LIBREDESK_IMAGE` to the new release tag and digest, then pull it.
+4. Run exactly one migration process: `docker compose run --rm --no-deps app /libredesk/libredesk --upgrade --yes --config /libredesk/config.toml`.
+5. Start only the new application image with `docker compose up -d app` and verify `/readyz` before restoring traffic.
+
+The migration revokes all agent sessions and API keys. It also clears passwords for contacts affected by the legacy portal registration flow; those customers must use the verified password-reset email flow. Existing Widget Redis sessions are rejected by the new versioned session format. Do not roll the application binary back unless the database and upload store are restored to the matching pre-upgrade backup.
 
 See [installation docs](https://docs.libredesk.io/getting-started/installation)
 

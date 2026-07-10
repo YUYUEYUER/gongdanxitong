@@ -53,8 +53,8 @@ async function initWidget () {
         // Store widget config globally for access in App.vue
         app.config.globalProperties.$widgetConfig = widgetConfig
         app.mount('#app')
-    } catch (error) {
-        console.error('Error initializing widget:', error)
+    } catch {
+        console.error('Error initializing widget')
     }
 }
 

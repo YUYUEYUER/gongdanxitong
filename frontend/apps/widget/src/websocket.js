@@ -2,6 +2,7 @@
 import { useChatStore } from './store/chat.js'
 import { useWidgetStore } from './store/widget.js'
 import { playNotificationSound } from '@shared-ui/composables/useNotificationSound.js'
+import { postToParent } from './parentBridge.js'
 
 export const WS_EVENT = {
   JOIN: 'join',
@@ -55,13 +56,20 @@ export class WidgetWebSocketClient {
     if (this.isReconnecting || this.manualClose) return
 
     try {
-      this.socket = new WebSocket('/widget/ws')
+      const pageParams = new URLSearchParams(window.location.search)
+      const socketParams = new URLSearchParams()
+      const parentOrigin = pageParams.get('parent_origin')
+      const inboxID = pageParams.get('inbox_id')
+      if (parentOrigin) socketParams.set('parent_origin', parentOrigin)
+      if (inboxID) socketParams.set('inbox_id', inboxID)
+      const query = socketParams.toString()
+      this.socket = new WebSocket(query ? `/widget/ws?${query}` : '/widget/ws')
       this.socket.addEventListener('open', this.handleOpen.bind(this))
       this.socket.addEventListener('message', this.handleMessage.bind(this))
       this.socket.addEventListener('error', this.handleError.bind(this))
       this.socket.addEventListener('close', this.handleClose.bind(this))
-    } catch (error) {
-      console.error('Widget WebSocket connection error:', error)
+    } catch {
+      console.error('Widget WebSocket connection error')
       this.reconnect()
     }
   }
@@ -96,9 +104,7 @@ export class WidgetWebSocketClient {
       const data = JSON.parse(event.data)
       const handlers = {
         [WS_EVENT.JOINED]: () => {
-          if (window.parent && window.parent !== window) {
-            window.parent.postMessage({ type: 'REQUEST_PAGE_INFO' }, '*')
-          }
+          postToParent({ type: 'REQUEST_PAGE_INFO' })
         },
         [WS_EVENT.PONG]: () => {
           this.lastPong = Date.now()
@@ -121,7 +127,7 @@ export class WidgetWebSocketClient {
           }
         },
         [WS_EVENT.ERROR]: () => {
-          console.error('Widget WebSocket error:', data.data)
+          console.error('Widget WebSocket reported an error')
         },
         [WS_EVENT.TYPING]: () => {
           if (data.data && data.data.is_typing !== undefined) {
@@ -138,15 +144,15 @@ export class WidgetWebSocketClient {
       if (handler) {
         handler()
       } else {
-        console.warn(`Unknown widget websocket event: ${data.type}`)
+        console.warn('Unknown widget websocket event')
       }
-    } catch (error) {
-      console.error('Widget message handling error:', error)
+    } catch {
+      console.error('Widget message handling error')
     }
   }
 
-  handleError (event) {
-    console.error('Widget WebSocket error:', event)
+  handleError () {
+    console.error('Widget WebSocket transport error')
     this.reconnect()
   }
 
@@ -242,8 +248,8 @@ export class WidgetWebSocketClient {
             console.warn('No pong received in 30 seconds, closing widget connection')
             this.socket.close()
           }
-        } catch (e) {
-          console.error('Widget ping error:', e)
+        } catch {
+          console.error('Widget ping error')
           this.reconnect()
         }
       }
@@ -308,7 +314,7 @@ export class WidgetWebSocketClient {
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify(message))
     } else {
-      console.warn('Widget WebSocket is not open. Message not sent:', message)
+      console.warn('Widget WebSocket is not open; message was not sent')
     }
   }
 

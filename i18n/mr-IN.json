@@ -220,7 +220,7 @@
   "admin.inbox.livechat.tabs.installation": "इन्स्टॉलेशन",
   "admin.inbox.livechat.tabs.messages": "संदेश",
   "admin.inbox.livechat.tabs.prechat": "प्री-चॅट फॉर्म",
-  "admin.inbox.livechat.trustedDomains.description": "प्रत्येक ओळीत एक डोमेन लिहा. *.example.com फक्त सबडोमेनशी जुळते, मूळ डोमेन example.com वेगळे जोडा. रिकामे ठेवल्यास कोणत्याही डोमेनला परवानगी दिली जाईल.",
+  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only; add example.com separately. Leave empty to allow same-origin embedding only.",
   "admin.inbox.livechat.trustedDomains.list": "डोमेन यादी",
   "admin.inbox.livechat.userSettings.visitors": "व्हिजिटर",
   "admin.inbox.livechat.websiteUrl": "वेबसाइट URL",

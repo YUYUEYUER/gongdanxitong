@@ -6,6 +6,7 @@ import (
 
 	cmodels "github.com/abhinavxd/libredesk/internal/custom_attribute/models"
 	"github.com/abhinavxd/libredesk/internal/envelope"
+	"github.com/abhinavxd/libredesk/internal/jsonutil"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
@@ -132,7 +133,7 @@ func validateCustomAttribute(app *App, attribute cmodels.CustomAttribute) error 
 	if attribute.Key == "" {
 		return envelope.NewError(envelope.InputError, app.i18n.Ts("globals.messages.empty", "name", "`key`"), nil)
 	}
-	if slices.Contains(disallowedKeys, attribute.Key) {
+	if slices.Contains(disallowedKeys, attribute.Key) || jsonutil.IsUnsafeObjectKey(attribute.Key) {
 		return envelope.NewError(envelope.InputError, app.i18n.T("admin.customAttributes.keyNotAllowed"), nil)
 	}
 	return nil

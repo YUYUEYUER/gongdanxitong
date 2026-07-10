@@ -220,7 +220,7 @@
   "admin.inbox.livechat.tabs.installation": "Installering",
   "admin.inbox.livechat.tabs.messages": "Beskeder",
   "admin.inbox.livechat.tabs.prechat": "Præ-chat-formular",
-  "admin.inbox.livechat.trustedDomains.description": "Ét domæne pr. linje. *.example.com matcher kun underdomæner, tilføj hoveddomænet example.com separat. Lad feltet stå tomt for at tillade alle domæner.",
+  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only; add example.com separately. Leave empty to allow same-origin embedding only.",
   "admin.inbox.livechat.trustedDomains.list": "Domæneliste",
   "admin.inbox.livechat.userSettings.visitors": "Besøgende",
   "admin.inbox.livechat.websiteUrl": "Webstedets URL",

@@ -38,6 +38,7 @@
 import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
+import { consumeSensitiveFragmentToken } from '@shared-ui/utils/url.js'
 import api from '@/api'
 import AuthLayout from '@/layouts/auth/AuthLayout.vue'
 import { Button } from '@shared-ui/components/ui/button'
@@ -55,7 +56,7 @@ const isLoading = ref(false)
 const errorMessage = ref('')
 
 onMounted(() => {
-  token.value = String(route.query.token || '')
+  token.value = consumeSensitiveFragmentToken(route.query.token)
   if (!token.value) {
     router.push('/portal/login')
   }

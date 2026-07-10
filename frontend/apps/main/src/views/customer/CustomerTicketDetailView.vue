@@ -75,7 +75,7 @@
           </div>
 
           <div class="mt-4 text-sm leading-7 text-foreground">
-            <Letter
+            <SecureLetter
               v-if="isHTMLMessage(message)"
               :html="messageHTML(message)"
               :allowedSchemas="['cid', 'https', 'http', 'mailto']"
@@ -96,7 +96,7 @@
               @click="openImagePreview(message, attachment)"
             >
               <img
-                :src="attachment.url"
+                :src="sanitizeHttpUrl(attachment.thumbnail_url)"
                 :alt="attachment.name"
                 class="h-24 w-24 object-cover transition duration-200 group-hover:scale-[1.03]"
               />
@@ -105,9 +105,9 @@
             <a
               v-for="attachment in fileAttachments(message)"
               :key="`${message.uuid}-${attachment.uuid}-file`"
-              :href="attachment.url"
+              :href="downloadUrl(attachment.download_url || attachment.url) || undefined"
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               class="inline-flex items-center gap-2 rounded-full border border-border bg-background px-3 py-2 text-xs font-medium text-foreground transition hover:border-primary/35"
             >
               <Paperclip class="h-3.5 w-3.5 text-muted-foreground" />
@@ -257,7 +257,9 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
 import { Button } from '@shared-ui/components/ui/button'
-import { Letter } from 'vue-letter'
+import SecureLetter from '@shared-ui/components/SecureLetter.vue'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
+import { downloadUrl, isSafePreviewImage } from '@shared-ui/utils/file.js'
 import { allowedCssProperties } from 'lettersanitizer'
 import {
   CheckCircle2,
@@ -374,10 +376,7 @@ function removeAttachment(id) {
 }
 
 function isImageAttachment(attachment) {
-  return (
-    (attachment?.content_type || '').startsWith('image/') ||
-    /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(attachment?.name || '')
-  )
+  return isSafePreviewImage(attachment)
 }
 
 function imageAttachments(message) {
@@ -389,7 +388,7 @@ function fileAttachments(message) {
 }
 
 function isImageFile(file) {
-  return file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name)
+  return isSafePreviewImage(file)
 }
 
 function handleFileChange(event) {

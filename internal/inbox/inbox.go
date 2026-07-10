@@ -336,6 +336,7 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 	if err != nil {
 		return imodels.Inbox{}, err
 	}
+	secretChanged := false
 
 	// Preserve existing passwords if update has empty password
 	switch current.Channel {
@@ -430,8 +431,13 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 		// Preserve existing secret if update contains password dummy
 		if inbox.Secret.Valid && strings.Contains(inbox.Secret.String, stringutil.PasswordDummy) {
 			inbox.Secret = current.Secret
-		} else if inbox.Secret.Valid && inbox.Secret.String != "" {
-			// Encrypt new secret
+		} else {
+			secretChanged = inbox.Secret.Valid != current.Secret.Valid || inbox.Secret.String != current.Secret.String
+		}
+
+		// GetDBRecord returns decrypted values. Always encrypt the selected
+		// secret before writing it back, including the masked/preserved case.
+		if inbox.Secret.Valid && inbox.Secret.String != "" {
 			encryptedSecret, err := crypto.Encrypt(inbox.Secret.String, m.encryptionKey)
 			if err != nil {
 				return imodels.Inbox{}, fmt.Errorf("encrypting inbox secret: %w", err)
@@ -439,6 +445,8 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 			inbox.Secret = null.StringFrom(encryptedSecret)
 		}
 	}
+
+	widgetSessionVersion := nextWidgetSessionVersion(current, inbox, secretChanged)
 
 	// Encrypt sensitive fields before updating
 	encryptedConfig, err := m.encryptInboxConfig(inbox.Config)
@@ -449,7 +457,7 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 
 	// Update the inbox in the DB.
 	var updatedInbox imodels.Inbox
-	if err := m.queries.Update.Get(&updatedInbox, id, inbox.Channel, encryptedConfig, inbox.Name, inbox.From, inbox.CSATEnabled, inbox.PromptTagsOnReply, inbox.Enabled, inbox.Secret, inbox.LinkedEmailInboxID, inbox.FromNameTemplate); err != nil {
+	if err := m.queries.Update.Get(&updatedInbox, id, inbox.Channel, encryptedConfig, inbox.Name, inbox.From, inbox.CSATEnabled, inbox.PromptTagsOnReply, inbox.Enabled, inbox.Secret, inbox.LinkedEmailInboxID, inbox.FromNameTemplate, widgetSessionVersion); err != nil {
 		m.lo.Error("error updating inbox", "error", err)
 		return imodels.Inbox{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
@@ -466,6 +474,22 @@ func (m *Manager) Update(id int, inbox imodels.Inbox) (imodels.Inbox, error) {
 	m.decryptInboxSecret(&updatedInbox)
 
 	return updatedInbox, nil
+}
+
+// nextWidgetSessionVersion revokes livechat sessions only when their security
+// boundary changes. Config and display-only edits do not force users to log in
+// again, while secret rotation, disabling, and channel changes do.
+func nextWidgetSessionVersion(current, update imodels.Inbox, secretChanged bool) int64 {
+	version := current.WidgetSessionVersion
+	if version < 1 {
+		version = 1
+	}
+
+	if current.Channel != update.Channel ||
+		(current.Channel == ChannelLiveChat && (secretChanged || current.Enabled != update.Enabled)) {
+		version++
+	}
+	return version
 }
 
 // Toggle toggles the status of an inbox in the DB.

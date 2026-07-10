@@ -66,11 +66,16 @@ func New(opt Opt) (media.Store, error) {
 // Put uploads a file to S3 with the specified name, content type, and file content.
 // It returns the name of the file or an error if the upload fails.
 func (c *Client) Put(name string, cType string, file io.ReadSeeker) (string, error) {
+	storedContentType := safeStoredContentType(cType)
 	p := simples3.UploadInput{
 		Bucket:      c.opts.Bucket,
-		ContentType: cType,
-		FileName:    name,
-		Body:        file,
+		ContentType: storedContentType,
+		// Public URLs cannot override response headers. Persisting attachment
+		// disposition prevents uploaded documents from becoming active pages on
+		// a CDN or a cookie-bearing sibling subdomain.
+		ContentDisposition: "attachment",
+		FileName:           name,
+		Body:               file,
 		// Paths inside the bucket should not start with /.
 		ObjectKey: c.makeBucketPath(name),
 	}
@@ -80,10 +85,21 @@ func (c *Client) Put(name string, cType string, file io.ReadSeeker) (string, err
 	}
 
 	if _, err := c.s3.FilePut(p); err != nil {
-		return "", fmt.Errorf("s3 put bucket=%q key=%q content_type=%q: %w", c.opts.Bucket, p.ObjectKey, cType, err)
+		return "", fmt.Errorf("s3 put bucket=%q key=%q content_type=%q: %w", c.opts.Bucket, p.ObjectKey, storedContentType, err)
 	}
 
 	return name, nil
+}
+
+func safeStoredContentType(contentType string) string {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	switch mediaType {
+	case "text/html", "application/xhtml+xml", "image/svg+xml", "application/xml", "text/xml",
+		"text/javascript", "application/javascript", "application/ecmascript", "text/ecmascript":
+		return "application/octet-stream"
+	default:
+		return contentType
+	}
 }
 
 // GetURL generates a URL to access the file stored in S3.

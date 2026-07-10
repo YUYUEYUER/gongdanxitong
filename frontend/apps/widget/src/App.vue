@@ -13,16 +13,18 @@
 </template>
 
 <script setup>
-import { computed, onMounted, watch, getCurrentInstance } from 'vue'
+import { computed, onBeforeUnmount, onMounted, watch, getCurrentInstance } from 'vue'
 import { useWidgetStore } from './store/widget.js'
 import { useChatStore } from '@widget/store/chat.js'
 import { useUserStore } from './store/user.js'
 import { initWidgetWS, closeWidgetWebSocket, sendPageVisit, skipInitialWsSync } from './websocket.js'
-import api, { setApiSessionToken, initVisitorToken, saveSession, registerStores } from '@widget/api/index.js'
+import api, { clearVisitorToken, setApiSessionToken, initVisitorToken, saveSession, registerStores } from '@widget/api/index.js'
 import { useUnreadCount } from './composables/useUnreadCount.js'
 import { initAudioContext } from '@shared-ui/composables/useNotificationSound.js'
 import { hexToHSL, getContrastingHSL } from '@shared-ui/utils/color.js'
 import MainLayout from '@widget/layouts/MainLayout.vue'
+import { postToParent, startParentBridge, stopParentBridge } from './parentBridge.js'
+import { createOrderedAuthHandler } from './authOperationQueue.js'
 
 const widgetStore = useWidgetStore()
 const chatStore = useChatStore()
@@ -50,12 +52,15 @@ const customColorStyle = computed(() => {
 })
 
 onMounted(() => {
-  setupParentMessageListeners()
-  window.parent.postMessage({ type: 'VUE_APP_READY' }, '*')
+  startParentBridge({
+    domains: widgetConfig?.trusted_domains || [],
+    expectedOrigin: new URLSearchParams(window.location.search).get('parent_origin') || '',
+    onMessage: dispatchParentMessage
+  })
 })
 
 const signalWidgetLoaded = () => {
-  window.parent.postMessage({ type: 'WIDGET_LOADED' }, '*')
+  postToParent({ type: 'WIDGET_LOADED' })
 }
 
 const fetchInitialConversations = async () => {
@@ -70,69 +75,83 @@ const fetchInitialConversations = async () => {
   }
 }
 
-// Listen for messages from parent window (widget.js)
-const setupParentMessageListeners = () => {
-  window.addEventListener('message', async (event) => {
-    if (event.data.type == 'WIDGET_CLOSED') {
+const restoreSession = async () => {
+  try {
+    const meResp = await api.getAuthMe()
+    const authData = meResp?.data?.data || {}
+    const sessionToken = authData.session_token
+    const user = authData.user || authData
+    if (!sessionToken) return false
+
+    userStore.setSessionToken(sessionToken)
+    setApiSessionToken(sessionToken)
+    userStore.setUserMeta(user)
+    initVisitorToken(user?.is_visitor ? sessionToken : '')
+    skipInitialWsSync()
+    postToParent({ type: 'CLEAR_SESSION_TOKEN' })
+    postToParent({ type: 'CLEAR_VISITOR_TOKEN' })
+    return true
+  } catch {
+    setApiSessionToken('')
+    return false
+  }
+}
+
+// Messages have already passed source, origin, nonce and schema checks in parentBridge.
+const handleParentMessage = async (data) => {
+    if (data.type === 'WIDGET_CLOSED') {
       widgetStore.setOpen(false)
-    } else if (event.data.type === 'WIDGET_OPENED') {
+    } else if (data.type === 'WIDGET_OPENED') {
       widgetStore.setOpen(true)
-    } else if (event.data.type === 'SET_MOBILE_STATE') {
-      widgetStore.setMobileFullScreen(event.data.isMobile)
-    } else if (event.data.type === 'WIDGET_EXPANDED') {
-      widgetStore.setExpanded(event.data.isExpanded)
-    } else if (event.data.type === 'SESSION_DATA') {
-      if (event.data.visitorToken) {
-        initVisitorToken(event.data.visitorToken)
-      }
-      const sessionToken = event.data.sessionToken
+    } else if (data.type === 'SET_MOBILE_STATE') {
+      widgetStore.setMobileFullScreen(data.isMobile)
+    } else if (data.type === 'WIDGET_EXPANDED') {
+      widgetStore.setExpanded(data.isExpanded)
+    } else if (data.type === 'SESSION_DATA') {
       try {
-        if (sessionToken) {
-          userStore.setSessionToken(sessionToken)
-          setApiSessionToken(sessionToken)
-          // Session exists, fetchInitialConversations will load data. Skip WS sync.
-          skipInitialWsSync()
-          // Fetch user metadata for returning visitors.
-          // Guard against stale response if SET_JWT_TOKEN exchange replaced the token.
-          try {
-            const meResp = await api.getAuthMe()
-            if (userStore.userSessionToken === sessionToken) {
-              userStore.setUserMeta(meResp.data.data)
-            }
-          } catch {
-            // 401 is handled by the global response interceptor.
-          }
-        }
+        await restoreSession()
         await fetchInitialConversations()
       } finally {
         signalWidgetLoaded()
       }
-    } else if (event.data.type === 'SET_JWT_TOKEN') {
-      if (event.data.visitorToken) {
-        initVisitorToken(event.data.visitorToken)
-      }
-      if (event.data.jwt) {
+    } else if (data.type === 'SET_JWT_TOKEN') {
+      if (data.jwt) {
         try {
-          const resp = await api.exchangeJWTForSession(event.data.jwt)
+          const resp = await api.exchangeJWTForSession(data.jwt)
           const { session_token, user } = resp.data.data
           saveSession(session_token, user, userStore)
+          postToParent({ type: 'CLEAR_SESSION_TOKEN' })
           // Session exists, fetchInitialConversations will load data. Skip WS sync.
           skipInitialWsSync()
           chatStore.conversations = null
           await fetchInitialConversations()
-        } catch (err) {
-          console.error('Failed to exchange JWT for session:', err)
+        } catch {
+          console.error('Failed to exchange JWT for session')
         } finally {
           signalWidgetLoaded()
         }
       }
-    } else if (event.data.type === 'CLEAR_SESSION') {
-      userStore.clearSessionToken()
-    } else if (event.data.type === 'PAGE_VISIT') {
-      sendPageVisit(event.data.url, event.data.title)
+    } else if (data.type === 'CLEAR_SESSION') {
+      try {
+        await api.logout()
+        userStore.clearSessionToken()
+        setApiSessionToken('')
+        clearVisitorToken()
+        chatStore.setCurrentConversation(null)
+        chatStore.conversations = null
+        postToParent({ type: 'SESSION_CLEARED' })
+      } catch {
+        console.error('Failed to revoke widget session')
+        postToParent({ type: 'SESSION_CLEAR_FAILED' })
+      }
+    } else if (data.type === 'PAGE_VISIT') {
+      sendPageVisit(data.url, data.title)
     }
-  })
 }
+
+const dispatchParentMessage = createOrderedAuthHandler(handleParentMessage)
+
+onBeforeUnmount(stopParentBridge)
 
 const initializeWebSocket = () => {
   const token = userStore.userSessionToken

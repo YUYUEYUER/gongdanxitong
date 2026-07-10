@@ -233,7 +233,7 @@
   "admin.inbox.livechat.tabs.installation": "安装",
   "admin.inbox.livechat.tabs.messages": "消息",
   "admin.inbox.livechat.tabs.prechat": "聊天前表单",
-  "admin.inbox.livechat.trustedDomains.description": "每行一个域名。*.example.com 仅匹配子域名，需单独添加裸域 example.com。留空允许任何域名。",
+  "admin.inbox.livechat.trustedDomains.description": "每行一个域名。*.example.com 仅匹配子域名，需单独添加裸域 example.com。留空时仅允许同源嵌入。",
   "admin.inbox.livechat.trustedDomains.list": "域名列表",
   "admin.inbox.livechat.userSettings.visitors": "访客",
   "admin.inbox.livechat.websiteUrl": "网站 URL",

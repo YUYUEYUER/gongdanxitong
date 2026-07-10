@@ -37,6 +37,8 @@ var (
 	efs embed.FS
 )
 
+const maxWebhookResponseBytes = 64 << 10
+
 // Manager handles webhook-related operations.
 type Manager struct {
 	q             queries
@@ -353,8 +355,7 @@ func (m *Manager) deliverSingleWebhook(webhook models.Webhook, task DeliveryTask
 		"webhook_id", webhook.ID,
 		"url", webhook.URL,
 		"event", task.Event,
-		"payload", string(payloadBytes),
-		"headers", req.Header,
+		"payload_bytes", len(payloadBytes),
 	)
 
 	// Make the request
@@ -369,8 +370,7 @@ func (m *Manager) deliverSingleWebhook(webhook models.Webhook, task DeliveryTask
 	}
 	defer resp.Body.Close()
 
-	// Read response body
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, responseTruncated, err := readLimitedResponse(resp.Body, maxWebhookResponseBytes)
 	if err != nil {
 		m.lo.Error("error reading webhook response", "webhook_id", webhook.ID, "error", err)
 		responseBody = []byte(fmt.Sprintf("Error reading response: %v", err))
@@ -391,8 +391,23 @@ func (m *Manager) deliverSingleWebhook(webhook models.Webhook, task DeliveryTask
 			"event", task.Event,
 			"url", webhook.URL,
 			"status_code", resp.StatusCode,
-			"response", string(responseBody))
+			"response", string(responseBody),
+			"response_truncated", responseTruncated)
 	}
+}
+
+func readLimitedResponse(r io.Reader, limit int64) ([]byte, bool, error) {
+	if limit <= 0 {
+		return nil, false, fmt.Errorf("response limit must be positive")
+	}
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(body)) > limit {
+		return body[:limit], true, nil
+	}
+	return body, false, nil
 }
 
 // generateSignature generates HMAC-SHA256 signature for webhook payload.

@@ -79,7 +79,7 @@
                     <p class="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                       {{ $t('command.replyPreview') }}
                     </p>
-                    <Letter
+                    <SecureLetter
                       :key="highlightedMacro?.value"
                       :html="replyContent"
                       :allowedSchemas="['cid', 'https', 'http', 'mailto']"
@@ -246,7 +246,7 @@ import { Calendar } from '@shared-ui/components/ui/calendar'
 import { Input } from '@shared-ui/components/ui/input'
 import { Label } from '@shared-ui/components/ui/label'
 import { useI18n } from 'vue-i18n'
-import { Letter } from 'vue-letter'
+import SecureLetter from '@shared-ui/components/SecureLetter.vue'
 
 const RENDER_CAP = 200
 

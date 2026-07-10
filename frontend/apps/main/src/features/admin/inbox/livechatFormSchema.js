@@ -4,7 +4,20 @@ import { isGoDuration } from '@shared-ui/utils/string'
 const hexColorRegex = /^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/
 const hexColor = (t) => z.string().regex(hexColorRegex, { message: t('validation.invalidColor') })
 const optionalHexColor = (t) => hexColor(t).optional().or(z.literal(''))
-const optionalUrl = (t) => z.string().url({ message: t('validation.invalidUrl') }).optional().or(z.literal(''))
+const isHTTPUrl = (value) => {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol)
+  } catch {
+    return false
+  }
+}
+const optionalUrl = (t) => z.string()
+  .url({ message: t('validation.invalidUrl') })
+  .refine(isHTTPUrl, {
+    message: t('validation.invalidUrl')
+  })
+  .optional()
+  .or(z.literal(''))
 const rangeNumber = (t, min, max) => {
   const msg = t('validation.minmaxNumber', { min, max })
   return z.coerce.number({ invalid_type_error: msg }).min(min, { message: msg }).max(max, { message: msg })

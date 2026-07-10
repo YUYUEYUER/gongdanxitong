@@ -13,7 +13,7 @@
           <div class="flex items-center gap-2 text-sm text-foreground">
             <span>{{ $t('update.newUpdateAvailable') }}</span>
             <a
-              :href="appSettingsStore.settings['app.update'].update.url"
+              :href="sanitizeHttpUrl(appSettingsStore.settings['app.update'].update.url) || undefined"
               target="_blank"
               rel="nofollow noopener noreferrer"
               class="font-semibold text-primary hover:text-primary/80 underline transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-1"
@@ -59,5 +59,6 @@
 <script setup>
 import { Download, Info } from 'lucide-vue-next'
 import { useAppSettingsStore } from '@/stores/appSettings'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 const appSettingsStore = useAppSettingsStore()
 </script>

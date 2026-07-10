@@ -27,6 +27,8 @@ func testSecurityApp(t *testing.T) *App {
 		"auth.rateLimited":"Too many attempts. Please try again later.",
 		"auth.turnstileRequired":"Please complete the verification challenge.",
 		"globals.messages.badRequest":"Bad request",
+		"globals.messages.somethingWentWrong":"Something went wrong",
+		"globals.messages.tooManyRequests":"Too many requests",
 		"publicTicket.nameRequired":"Please enter your name.",
 		"validation.invalidEmail":"Invalid email address"
 	}`))
@@ -34,6 +36,20 @@ func testSecurityApp(t *testing.T) *App {
 
 	lo := logf.New(logf.Opts{})
 	return &App{ctx: context.Background(), i18n: tr, lo: &lo}
+}
+
+func TestRequestBodyLimit(t *testing.T) {
+	app := testSecurityApp(t)
+	called := false
+	handler := requestBodyLimit(func(_ *fastglue.Request) error {
+		called = true
+		return nil
+	}, 4)
+	req := testFastRequest(app, fasthttp.MethodPost, "application/json")
+	req.RequestCtx.Request.SetBodyString("12345")
+	_ = handler(req)
+	require.False(t, called)
+	require.Equal(t, fasthttp.StatusRequestEntityTooLarge, req.RequestCtx.Response.StatusCode())
 }
 
 func testFastRequest(app *App, method, contentType string) *fastglue.Request {
@@ -79,24 +95,37 @@ func TestRequireJSONPost(t *testing.T) {
 	requireEnvelopeError(t, requireJSONPost(testFastRequest(app, fasthttp.MethodPost, "text/plain").RequestCtx, app), envelope.InputError, fasthttp.StatusUnsupportedMediaType)
 }
 
+func TestSafeNextPathRejectsExternalRedirects(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "/inboxes/assigned?status=open", safeNextPath("/inboxes/assigned?status=open", "/"))
+	for _, raw := range []string{
+		"https://evil.example/path",
+		"//evil.example/path",
+		"/\\evil.example/path",
+		"/%2f%2fevil.example/path",
+		"javascript:alert(1)",
+		"/safe\r\nLocation: https://evil.example",
+	} {
+		require.Equal(t, "/fallback", safeNextPath(raw, "/fallback"), raw)
+	}
+}
+
 func TestValidateCustomerRegisterFields(t *testing.T) {
 	app := testSecurityApp(t)
 
 	requireEnvelopeError(t, validateCustomerRegisterFields(app, customerRegisterRequest{
-		Email:    "user@example.com",
-		Password: "StrongPassword1!",
+		Email: "user@example.com",
 	}), envelope.InputError, fasthttp.StatusBadRequest)
 
 	requireEnvelopeError(t, validateCustomerRegisterFields(app, customerRegisterRequest{
 		FirstName: "User",
 		Email:     "not-an-email",
-		Password:  "StrongPassword1!",
 	}), envelope.InputError, fasthttp.StatusBadRequest)
 
 	require.NoError(t, validateCustomerRegisterFields(app, customerRegisterRequest{
 		FirstName: "User",
 		Email:     "user@example.com",
-		Password:  "StrongPassword1!",
 	}))
 }
 
@@ -117,6 +146,20 @@ func TestCheckCustomerRegisterRateLimit(t *testing.T) {
 
 	err := checkCustomerRegisterRateLimit(t.Context(), app, "203.0.113.10", "test-agent", req)
 	requireEnvelopeError(t, err, envelope.RateLimitError, fasthttp.StatusTooManyRequests)
+}
+
+func TestCheckCustomerRegisterRateLimitFailsClosed(t *testing.T) {
+	app := testSecurityApp(t)
+	srv := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: srv.Addr()})
+	app.rateLimit = ratelimit.New(client)
+	srv.Close()
+
+	err := checkCustomerRegisterRateLimit(t.Context(), app, "203.0.113.10", "test-agent", customerRegisterRequest{
+		FirstName: "Rate",
+		Email:     "rate@example.com",
+	})
+	requireEnvelopeError(t, err, envelope.GeneralError, fasthttp.StatusServiceUnavailable)
 }
 
 func TestCustomerRegisterRequestTurnstileResponse(t *testing.T) {
@@ -159,10 +202,22 @@ func TestHandleCustomerLoginRequiresTurnstileToken(t *testing.T) {
 	req := testFastRequest(app, fasthttp.MethodPost, "application/json")
 	req.RequestCtx.Request.SetRequestURI("/api/v1/customer/auth/login")
 	req.RequestCtx.Request.SetBodyString(`{"email":"user@example.com","password":"Password1!"}`)
+	req.RequestCtx.Request.Header.SetCookie("csrf_token", "same-token")
+	req.RequestCtx.Request.Header.Set("X-CSRFTOKEN", "same-token")
 
 	require.NoError(t, handleCustomerLogin(req))
 	require.Equal(t, fasthttp.StatusBadRequest, req.RequestCtx.Response.StatusCode())
 	require.Contains(t, string(req.RequestCtx.Response.Body()), "Please complete the verification challenge.")
+}
+
+func TestHandleCustomerLoginRequiresCSRFToken(t *testing.T) {
+	app := testSecurityApp(t)
+	req := testFastRequest(app, fasthttp.MethodPost, "application/json")
+	req.RequestCtx.Request.SetBodyString(`{"email":"user@example.com","password":"Password1!"}`)
+
+	require.NoError(t, handleCustomerLogin(req))
+	require.Equal(t, fasthttp.StatusForbidden, req.RequestCtx.Response.StatusCode())
+	require.Contains(t, string(req.RequestCtx.Response.Body()), "Page state expired")
 }
 
 func requireEnvelopeError(t *testing.T, err error, errorType string, code int) {

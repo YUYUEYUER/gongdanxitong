@@ -139,8 +139,8 @@ export const useChatStore = defineStore('chat', () => {
             if (resp.data.data.messages.length > 0) {
                 updateConversationListLastMessage(conversationUUID, resp.data.data.messages[0], false)
             }
-        } catch (error) {
-            console.error('Error fetching conversation:', error)
+        } catch {
+            console.error('Error fetching conversation')
             return false
         } finally {
             isLoadingConversation.value = false
@@ -237,8 +237,8 @@ export const useChatStore = defineStore('chat', () => {
                     conv.unread_message_count = 0
                 }
             }
-        } catch (error) {
-            console.error('Error updating last seen:', error)
+        } catch {
+            console.error('Error updating last seen')
         }
     }
 

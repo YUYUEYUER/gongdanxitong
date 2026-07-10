@@ -146,6 +146,12 @@ const customerRegister = (data) =>
       'Content-Type': 'application/json'
     }
   })
+const customerVerifyEmail = (data) =>
+  http.post('/api/v1/customer/auth/verify-email', data, {
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  })
 const customerLogin = (data) =>
   http.post('/api/v1/customer/auth/login', data, {
     headers: {
@@ -755,6 +761,7 @@ export default {
   getPublicTicketCaptcha,
   submitPublicTicket,
   customerRegister,
+  customerVerifyEmail,
   customerLogin,
   customerForgotPassword,
   customerResetPassword,

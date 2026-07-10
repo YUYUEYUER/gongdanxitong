@@ -1,9 +1,30 @@
 package conversation
 
 import (
+	"bytes"
+	stdimage "image"
+	"image/png"
 	"strings"
 	"testing"
 )
+
+func TestValidateIncomingImageAttachmentRejectsResourceBombShape(t *testing.T) {
+	t.Parallel()
+
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, stdimage.NewRGBA(stdimage.Rect(0, 0, 1, 101))); err != nil {
+		t.Fatal(err)
+	}
+	isImage, err := validateIncomingImageAttachment(encoded.Bytes())
+	if !isImage || err == nil {
+		t.Fatalf("extreme image must be detected and rejected, isImage=%v err=%v", isImage, err)
+	}
+
+	isImage, err = validateIncomingImageAttachment([]byte("plain attachment"))
+	if isImage || err != nil {
+		t.Fatalf("non-image attachment should pass through, isImage=%v err=%v", isImage, err)
+	}
+}
 
 const testUUID = "d0355103-455f-4c7d-b9c7-86e9254fe119"
 const testUUID2 = "edb7be78-ef7d-4fe9-888b-22494f0ce076"

@@ -6,7 +6,7 @@ import (
 	amodels "github.com/abhinavxd/libredesk/internal/auth/models"
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
-	realip "github.com/ferluci/fast-realip"
+	umodels "github.com/abhinavxd/libredesk/internal/user/models"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 )
@@ -37,7 +37,7 @@ func handleOIDCLogin(r *fastglue.Request) error {
 	sessionValues := map[string]any{
 		oidcStateSessKey: state,
 		// For redirecting after login
-		oidcNextSessKey: string(r.RequestCtx.QueryArgs().Peek("next")),
+		oidcNextSessKey: safeNextPath(string(r.RequestCtx.QueryArgs().Peek("next")), "/"),
 	}
 
 	if err = app.auth.SetSessionValues(r, sessionValues); err != nil {
@@ -59,7 +59,7 @@ func handleOIDCCallback(r *fastglue.Request) error {
 		code            = string(r.RequestCtx.QueryArgs().Peek("code"))
 		state           = string(r.RequestCtx.QueryArgs().Peek("state"))
 		providerID, err = strconv.Atoi(string(r.RequestCtx.UserValue("id").(string)))
-		ip              = realip.FromRequest(r.RequestCtx)
+		ip              = requestClientIP(app, r.RequestCtx)
 	)
 	if err != nil {
 		app.lo.Error("error parsing provider id", "error", err)
@@ -75,6 +75,22 @@ func handleOIDCCallback(r *fastglue.Request) error {
 	if state != sessionState {
 		return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 	}
+	nextParam, _ := app.auth.GetSessionValue(r, oidcNextSessKey)
+	redirectURL := "/"
+	if nextStr, ok := nextParam.(string); ok && nextStr != "" {
+		redirectURL = safeNextPath(nextStr, "/")
+	}
+	// State is single-use and the authenticated session must not reuse the
+	// pre-authentication session identifier.
+	if err := app.auth.DestroySession(r); err != nil {
+		app.lo.Error("error consuming OIDC pre-auth session", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
+	}
+
+	// Hold a provider read lease through identity resolution and session
+	// creation. Deletion takes the write side before revoking linked users.
+	app.oidcAuthMu.RLock()
+	defer app.oidcAuthMu.RUnlock()
 
 	_, claims, err := app.auth.ExchangeOIDCToken(r.RequestCtx, providerID, code)
 	if err != nil {
@@ -83,18 +99,41 @@ func handleOIDCCallback(r *fastglue.Request) error {
 			app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 	}
 
-	// Lookup the user by email and set the session.
-	user, err := app.user.GetAgent(0, claims.Email)
+	// Resolve a stable issuer+subject identity. Only the first login is allowed
+	// to link by a verified email address.
+	identityUserID, found, err := app.oidc.ResolveUserIdentity(claims.Issuer, claims.Sub)
 	if err != nil {
 		return sendErrorEnvelope(r, err)
 	}
+	var user umodels.User
+	if found {
+		user, err = app.user.GetAgent(identityUserID, "")
+	} else {
+		user, err = app.user.GetAgent(0, claims.Email)
+		if err == nil {
+			boundUserID, bindErr := app.oidc.BindUserIdentity(providerID, claims.Issuer, claims.Sub, user.ID, claims.Email)
+			if bindErr != nil {
+				return sendErrorEnvelope(r, bindErr)
+			}
+			if boundUserID != user.ID {
+				return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.PermissionError)
+			}
+		}
+	}
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if !user.Enabled {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, app.i18n.T("user.accountDisabled"), nil, envelope.PermissionError)
+	}
 
 	if err := app.auth.SaveSession(amodels.User{
-		ID:        user.ID,
-		Email:     user.Email.String,
-		FirstName: user.FirstName,
-		LastName:  user.LastName,
-		Type:      user.Type,
+		ID:             user.ID,
+		Email:          user.Email.String,
+		FirstName:      user.FirstName,
+		LastName:       user.LastName,
+		Type:           user.Type,
+		SessionVersion: user.SessionVersion,
 	}, r); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError,
 			app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
@@ -110,13 +149,6 @@ func handleOIDCCallback(r *fastglue.Request) error {
 	// Insert activity log.
 	if err := app.activityLog.Login(user.ID, user.Email.String, ip); err != nil {
 		app.lo.Error("error creating login activity log", "error", err)
-	}
-
-	// Read the 'next' parameter from session to redirect after login.
-	nextParam, _ := app.auth.GetSessionValue(r, oidcNextSessKey)
-	redirectURL := "/"
-	if nextStr, ok := nextParam.(string); ok && nextStr != "" {
-		redirectURL = nextStr
 	}
 
 	return r.RedirectURI(redirectURL, fasthttp.StatusFound, nil, "")

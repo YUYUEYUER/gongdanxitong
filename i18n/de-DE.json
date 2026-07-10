@@ -193,7 +193,7 @@
   "admin.inbox.livechat.tabs.appearance": "Erscheinungsbild",
   "admin.inbox.livechat.tabs.installation": "Einrichtung",
   "admin.inbox.livechat.tabs.messages": "Nachrichten",
-  "admin.inbox.livechat.trustedDomains.description": "Eine Domain pro Zeile. *.example.com erfasst nur Subdomains, die Basisdomain example.com muss separat hinzugefügt werden. Leer lassen, um beliebige Domains zuzulassen.",
+  "admin.inbox.livechat.trustedDomains.description": "One domain per line. *.example.com matches subdomains only; add example.com separately. Leave empty to allow same-origin embedding only.",
   "admin.inbox.livechat.trustedDomains.list": "Domain-Liste",
   "admin.inbox.livechat.userSettings.visitors": "Besucher",
   "admin.inbox.livechat.websiteUrl": "Website-URL",

@@ -113,6 +113,7 @@ func handleDeleteTeam(r *fastglue.Request) error {
 	}
 	for _, mid := range memberIDs {
 		app.user.InvalidateAgentCache(mid)
+		app.wsHub.KickUser(mid)
 	}
 	return r.SendEnvelope(true)
 }

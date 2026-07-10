@@ -3,7 +3,7 @@
     :visible="modelValue"
     :imgs="imgs"
     :index="index"
-    :loop="images.length > 1"
+    :loop="imgs.length > 1"
     teleport="body"
     @hide="close"
     @on-index-change="onIndexChange"
@@ -13,6 +13,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import VueEasyLightbox from 'vue-easy-lightbox'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 
 const props = defineProps({
   modelValue: { type: Boolean, required: true },
@@ -24,7 +25,9 @@ const emit = defineEmits(['update:modelValue'])
 const index = ref(0)
 
 const imgs = computed(() =>
-  props.images.map((img) => ({ src: img.url, title: img.name || '' }))
+  props.images
+    .map((img) => ({ src: sanitizeHttpUrl(img.url), title: img.name || '' }))
+    .filter((img) => img.src)
 )
 
 function clamp(n, min, max) {
@@ -40,7 +43,7 @@ function onIndexChange(_prev, next) {
 }
 
 function step(delta) {
-  const total = props.images.length
+  const total = imgs.value.length
   if (total <= 1) return
   index.value = (index.value + delta + total) % total
 }
@@ -70,7 +73,7 @@ watch(
   () => props.modelValue,
   (open) => {
     if (open) {
-      index.value = clamp(props.startIndex, 0, props.images.length - 1)
+      index.value = clamp(props.startIndex, 0, Math.max(0, imgs.value.length - 1))
       document.addEventListener('keydown', onDocKeydown, true)
     } else {
       document.removeEventListener('keydown', onDocKeydown, true)

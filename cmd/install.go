@@ -64,6 +64,14 @@ func install(ctx context.Context, db *sqlx.DB, fs stuffbin.FileSystem, idempoten
 	if err := user.CreateSystemUser(ctx, password, db); err != nil {
 		log.Fatalf("error creating system user: %v", err)
 	}
+	// schema.sql always represents the current binary. Mark every bundled
+	// migration as applied so a fresh install never replays upgrade-only data
+	// transformations on first start.
+	for _, migration := range migList {
+		if err := recordMigrationVersion(migration.version, db); err != nil {
+			log.Fatalf("error recording installed schema version %s: %v", migration.version, err)
+		}
+	}
 	return nil
 }
 

@@ -1,5 +1,6 @@
 import { computed, watch } from 'vue'
 import { useChatStore } from '@widget/store/chat.js'
+import { postToParent } from '@widget/parentBridge.js'
 
 export function useUnreadCount() {
   const chatStore = useChatStore()
@@ -17,14 +18,12 @@ export function useUnreadCount() {
   // Send unread count to parent widget.
   const sendUnreadCountToWidget = (count) => {
     try {
-      if (window.parent && window.parent !== window) {
-        window.parent.postMessage({
-          type: 'UPDATE_UNREAD_COUNT',
-          count: count
-        }, '*')
-      }
-    } catch (error) {
-      console.error('Failed to send unread count to widget:', error)
+      postToParent({
+        type: 'UPDATE_UNREAD_COUNT',
+        count: count
+      })
+    } catch {
+      console.error('Failed to send unread count to widget')
     }
   }
 

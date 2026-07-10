@@ -13,7 +13,7 @@
         >
           <template v-if="isImage">
             <img
-              :src="getThumbFilepath(attachment.url)"
+              :src="getThumbFilepath(attachment.thumbnail_url)"
               :alt="attachment.name"
               class="w-full h-full object-cover"
             />
@@ -25,7 +25,7 @@
                 <p class="text-[10px] opacity-90">{{ formatBytes(attachment.size) }}</p>
               </div>
               <DownloadLink
-                :url="attachment.url"
+                :url="attachment.download_url || attachment.url"
                 class="text-white hover:text-white hover:bg-white/15 shrink-0 pointer-events-auto -mr-0.5"
               />
             </div>
@@ -45,7 +45,7 @@
 
           <DownloadLink
             v-if="!isImage"
-            :url="attachment.url"
+            :url="attachment.download_url || attachment.url"
             class="absolute top-1.5 right-1.5 opacity-0 group-hover:opacity-100 transition-opacity"
           />
         </div>
@@ -54,7 +54,7 @@
         <p class="text-xs font-medium truncate mb-2" :title="attachment.name">
           {{ attachment.name }}
         </p>
-        <audio :src="attachment.url" controls autoplay preload="auto" class="w-full h-8" />
+        <audio :src="sanitizeHttpUrl(attachment.url)" controls autoplay preload="metadata" class="w-full h-8" />
       </PopoverContent>
     </Popover>
   </div>
@@ -62,8 +62,9 @@
 
 <script setup>
 import { computed, ref } from 'vue'
-import { formatBytes, getThumbFilepath } from '@shared-ui/utils/file'
+import { downloadUrl, formatBytes, getThumbFilepath, isSafePreviewImage } from '@shared-ui/utils/file'
 import DownloadLink from '@/components/DownloadLink.vue'
+import { openSafeExternalUrl, sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 import { Popover, PopoverContent, PopoverTrigger } from '@shared-ui/components/ui/popover'
 import {
   FileText,
@@ -84,7 +85,7 @@ const showAudio = ref(false)
 
 const shortName = (name) => (name || '').substring(0, 40)
 
-const isImage = computed(() => (props.attachment.content_type || '').startsWith('image/'))
+const isImage = computed(() => isSafePreviewImage(props.attachment))
 
 const isAudio = computed(() => (props.attachment.content_type || '').startsWith('audio/'))
 
@@ -121,7 +122,7 @@ const onClick = () => {
   } else if (isAudio.value) {
     showAudio.value = true
   } else {
-    window.open(props.attachment.url, '_blank', 'noopener,noreferrer')
+    openSafeExternalUrl(downloadUrl(props.attachment.download_url || props.attachment.url))
   }
 }
 </script>

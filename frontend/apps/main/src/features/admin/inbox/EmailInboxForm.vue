@@ -874,6 +874,7 @@ import {
   PROVIDER_MICROSOFT
 } from '@/constants/auth.js'
 import { handleHTTPError } from '@shared-ui/utils/http.js'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 import { useAppSettingsStore } from '@/stores/appSettings'
 
 const props = defineProps({
@@ -1061,7 +1062,9 @@ const submitOAuthCredentials = async () => {
     }
 
     const response = await api.initiateOAuthFlow(selectedProvider.value, payload)
-    window.location.href = response.data.data
+    const redirectURL = sanitizeHttpUrl(response.data.data)
+    if (!redirectURL) throw new Error('Invalid OAuth redirect URL')
+    window.location.assign(redirectURL)
   } catch (error) {
     emitter.emit(EMITTER_EVENTS.SHOW_TOAST, {
       variant: 'destructive',

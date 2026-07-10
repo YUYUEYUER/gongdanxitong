@@ -44,12 +44,66 @@ FROM media
 WHERE model_type = $1
     AND model_id = $2;
 
--- name: get-unlinked-message-media
+-- name: get-unlinked-media
 SELECT id, created_at, updated_at, "uuid", store, filename, content_type, content_id, owner_user_id, model_id, model_type, disposition, "size", meta
 FROM media
-WHERE model_type = 'messages' 
-  AND (model_id IS NULL OR model_id = 0) 
-  AND created_at < NOW() - INTERVAL '7 days';
+WHERE (model_id IS NULL OR model_id = 0)
+  AND created_at < NOW() - INTERVAL '1 day';
+
+-- name: get-unlinked-media-usage
+SELECT COUNT(*), COALESCE(SUM(
+  COALESCE(size, 0) +
+  CASE
+    WHEN meta ? 'thumbnail_size' AND (meta->>'thumbnail_size') ~ '^[0-9]{1,10}$'
+      THEN (meta->>'thumbnail_size')::bigint
+    WHEN content_type LIKE 'image/%' THEN 131072
+    ELSE 0
+  END
+), 0)
+FROM media
+WHERE owner_user_id = $1
+  AND (model_id IS NULL OR model_id = 0);
+
+-- name: get-owned-media-usage
+SELECT COUNT(*), COALESCE(SUM(
+  COALESCE(size, 0) +
+  CASE
+    WHEN meta ? 'thumbnail_size' AND (meta->>'thumbnail_size') ~ '^[0-9]{1,10}$'
+      THEN (meta->>'thumbnail_size')::bigint
+    WHEN content_type LIKE 'image/%' THEN 131072
+    ELSE 0
+  END
+), 0)
+FROM media
+WHERE owner_user_id = $1;
+
+-- name: lock-global-media-quota
+SELECT pg_advisory_xact_lock(128026298704193);
+
+-- name: get-global-media-usage
+SELECT COALESCE(SUM(
+  1 + CASE
+    WHEN meta ? 'thumbnail_size' AND (meta->>'thumbnail_size') ~ '^[0-9]{1,10}$'
+      THEN CASE WHEN (meta->>'thumbnail_size')::bigint > 0 THEN 1 ELSE 0 END
+    WHEN content_type LIKE 'image/%' THEN 1
+    ELSE 0
+  END
+), 0), COALESCE(SUM(
+  COALESCE(size, 0) +
+  CASE
+    WHEN meta ? 'thumbnail_size' AND (meta->>'thumbnail_size') ~ '^[0-9]{1,10}$'
+      THEN (meta->>'thumbnail_size')::bigint
+    WHEN content_type LIKE 'image/%' THEN 131072
+    ELSE 0
+  END
+), 0)
+FROM media;
+
+-- name: lock-media-owner
+SELECT id
+FROM users
+WHERE id = $1 AND deleted_at IS NULL
+FOR UPDATE;
 
 -- name: content-id-exists
 SELECT m.uuid
@@ -72,3 +126,9 @@ UPDATE media
 SET content_id = $2
 WHERE id = $1
   AND (content_id IS NULL OR content_id = '');
+
+-- name: set-media-thumbnail-size
+UPDATE media
+SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), '{thumbnail_size}', to_jsonb($2::bigint), true),
+    updated_at = NOW()
+WHERE id = $1;

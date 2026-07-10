@@ -7,6 +7,8 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1" />
 
 	<link href="/static/public/static/style.css" rel="stylesheet" type="text/css" />
+	{{ with .Data.Stylesheet }}<link href="{{ . }}" rel="stylesheet" type="text/css" />{{ end }}
+	{{ with .Data.Script }}<script defer src="{{ . }}"></script>{{ end }}
 
 	{{ if ne FaviconURL "" }}
 		<link rel="icon" href="{{ FaviconURL }}" type="image/x-icon" />

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	amodels "github.com/abhinavxd/libredesk/internal/auth/models"
@@ -200,7 +199,6 @@ func handleGetViewConversations(r *fastglue.Request) error {
 	if err != nil {
 		return sendErrorEnvelope(r, err)
 	}
-
 	hasAccess := false
 	switch view.Visibility {
 	case vmodels.VisibilityUser:
@@ -325,8 +323,14 @@ func handleGetConversation(r *fastglue.Request) error {
 		return sendErrorEnvelope(r, err)
 	}
 
-	prev, _ := app.conversation.GetContactPreviousConversations(conv.ContactID, 10)
-	conv.PreviousConversations = filterCurrentPreviousConv(prev, conv.UUID)
+	prev, err := app.conversation.GetContactPreviousConversations(conv.ContactID, 50)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	conv.PreviousConversations, err = filterAccessiblePreviousConversations(app, user, prev, conv.UUID, 10)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 	return r.SendEnvelope(conv)
 }
 
@@ -352,6 +356,12 @@ func handleDownloadConversationTranscript(r *fastglue.Request) error {
 	messages, err := app.conversation.GetAllConversationMessages(uuid, &private, []string{cmodels.MessageIncoming, cmodels.MessageOutgoing})
 	if err != nil {
 		return sendErrorEnvelope(r, err)
+	}
+	app.conversation.ProcessCSATStatus(messages)
+	for i := range messages {
+		if messages[i].HasCSAT() {
+			messages[i].StripCSATUUID()
+		}
 	}
 
 	transcript := app.conversation.BuildTranscript(*conversation, messages, time.Now())
@@ -401,7 +411,6 @@ func handleUpdateConversationAssigneeLastSeen(r *fastglue.Request) error {
 	if err != nil {
 		return sendErrorEnvelope(r, err)
 	}
-
 	if err = app.conversation.UpdateUserLastSeen(uuid, auser.ID); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
@@ -475,7 +484,6 @@ func handleUpdateUserAssignee(r *fastglue.Request) error {
 	if err != nil {
 		return sendErrorEnvelope(r, err)
 	}
-
 	// Already assigned?
 	if conversation.AssignedUserID.Int == req.AssigneeID {
 		return r.SendEnvelope(true)
@@ -676,9 +684,15 @@ func handleUpdateConversationCustomAttributes(r *fastglue.Request) error {
 		auser      = r.RequestCtx.UserValue("user").(amodels.User)
 		uuid       = r.RequestCtx.UserValue("uuid").(string)
 	)
+	if err := validateAgentWriteBodySize(r.RequestCtx.PostBody(), app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 	if err := r.Decode(&attributes, ""); err != nil {
 		app.lo.Error("error unmarshalling custom attributes JSON", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
+	}
+	if err := validateCustomAttributesResourceBudget(attributes, app); err != nil {
+		return sendErrorEnvelope(r, err)
 	}
 
 	// Enforce conversation access.
@@ -688,6 +702,9 @@ func handleUpdateConversationCustomAttributes(r *fastglue.Request) error {
 	}
 	_, err = enforceConversationAccess(app, uuid, user)
 	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := checkAgentWriteRateLimit(app, user.ID); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
@@ -706,9 +723,15 @@ func handleUpdateContactCustomAttributes(r *fastglue.Request) error {
 		auser      = r.RequestCtx.UserValue("user").(amodels.User)
 		uuid       = r.RequestCtx.UserValue("uuid").(string)
 	)
+	if err := validateAgentWriteBodySize(r.RequestCtx.PostBody(), app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 	if err := r.Decode(&attributes, ""); err != nil {
 		app.lo.Error("error unmarshalling custom attributes JSON", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
+	}
+	if err := sanitizeContactCustomAttributes(attributes, app); err != nil {
+		return sendErrorEnvelope(r, err)
 	}
 
 	// Enforce conversation access.
@@ -718,6 +741,9 @@ func handleUpdateContactCustomAttributes(r *fastglue.Request) error {
 	}
 	conversation, err := enforceConversationAccess(app, uuid, user)
 	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if err := checkAgentWriteRateLimit(app, user.ID); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 	if err := app.user.SaveCustomAttributes(conversation.ContactID, attributes, false); err != nil {
@@ -786,14 +812,29 @@ func handleRemoveTeamAssignee(r *fastglue.Request) error {
 	return r.SendEnvelope(true)
 }
 
-// filterCurrentPreviousConv removes the current conversation from the list of previous conversations.
-func filterCurrentPreviousConv(convs []cmodels.PreviousConversation, uuid string) []cmodels.PreviousConversation {
-	for i, c := range convs {
-		if c.UUID == uuid {
-			return append(convs[:i], convs[i+1:]...)
+func filterAccessiblePreviousConversations(app *App, user umodels.User, convs []cmodels.PreviousConversation, currentUUID string, limit int) ([]cmodels.PreviousConversation, error) {
+	filtered := make([]cmodels.PreviousConversation, 0, min(limit, len(convs)))
+	for _, previous := range convs {
+		if previous.UUID == currentUUID {
+			continue
+		}
+		conversation, err := app.conversation.GetConversation(0, previous.UUID, "")
+		if err != nil {
+			continue
+		}
+		allowed, err := app.authz.EnforceConversationAccess(user, conversation)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			continue
+		}
+		filtered = append(filtered, previous)
+		if len(filtered) == limit {
+			break
 		}
 	}
-	return []cmodels.PreviousConversation{}
+	return filtered, nil
 }
 
 // handleCreateConversation creates a new conversation and sends a message to it.
@@ -803,16 +844,17 @@ func handleCreateConversation(r *fastglue.Request) error {
 		auser = r.RequestCtx.UserValue("user").(amodels.User)
 		req   = createConversationRequest{}
 	)
+	if err := validateAgentWriteBodySize(r.RequestCtx.PostBody(), app); err != nil {
+		return sendErrorEnvelope(r, err)
+	}
 
 	if err := r.Decode(&req, "json"); err != nil {
 		app.lo.Error("error decoding create conversation request", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("errors.parsingRequest"), nil, envelope.InputError)
 	}
 
-	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
-
 	// Validate the request
-	if err := validateCreateConversationRequest(req, app); err != nil {
+	if err := validateCreateConversationRequest(&req, app); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
@@ -820,6 +862,24 @@ func handleCreateConversation(r *fastglue.Request) error {
 	to := []string{email}
 	user, err := app.user.GetAgentCachedOrLoad(auser.ID)
 	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if req.Initiator == umodels.UserTypeContact {
+		if err := enforceAgentPermission(app, user, authzModels.PermMessagesWriteAsContact); err != nil {
+			return sendErrorEnvelope(r, err)
+		}
+	}
+	if req.AssignedTeamID > 0 {
+		if err := enforceAgentPermission(app, user, authzModels.PermConversationsUpdateTeamAssignee); err != nil {
+			return sendErrorEnvelope(r, err)
+		}
+	}
+	if req.AssignedAgentID > 0 {
+		if err := enforceAgentPermission(app, user, authzModels.PermConversationsUpdateUserAssignee); err != nil {
+			return sendErrorEnvelope(r, err)
+		}
+	}
+	if err := checkAgentWriteRateLimit(app, user.ID); err != nil {
 		return sendErrorEnvelope(r, err)
 	}
 
@@ -863,15 +923,22 @@ func handleCreateConversation(r *fastglue.Request) error {
 	// Get media for the attachment ids, skip any already associated with a model.
 	media, err := getUnassociatedMedia(app, req.Attachments, auser.ID)
 	if err != nil {
+		_ = app.conversation.DeleteConversation(conversationUUID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
 	}
 
 	// Assign team first, it clears any assigned agent.
 	if req.AssignedTeamID > 0 {
-		app.conversation.UpdateConversationTeamAssignee(conversationUUID, req.AssignedTeamID, user)
+		if err := app.conversation.UpdateConversationTeamAssignee(conversationUUID, req.AssignedTeamID, user); err != nil {
+			_ = app.conversation.DeleteConversation(conversationUUID)
+			return sendErrorEnvelope(r, err)
+		}
 	}
 	if req.AssignedAgentID > 0 {
-		app.conversation.UpdateConversationUserAssignee(conversationUUID, req.AssignedAgentID, user)
+		if err := app.conversation.UpdateConversationUserAssignee(conversationUUID, req.AssignedAgentID, user); err != nil {
+			_ = app.conversation.DeleteConversation(conversationUUID)
+			return sendErrorEnvelope(r, err)
+		}
 	}
 
 	// Send initial message based on the initiator of conversation.
@@ -908,7 +975,10 @@ func handleCreateConversation(r *fastglue.Request) error {
 }
 
 // validateCreateConversationRequest validates the create conversation request fields.
-func validateCreateConversationRequest(req createConversationRequest, app *App) error {
+func validateCreateConversationRequest(req *createConversationRequest, app *App) error {
+	if err := validateCreateConversationResourceBudget(req, app); err != nil {
+		return err
+	}
 	if req.InboxID <= 0 {
 		return envelope.NewError(envelope.InputError, app.i18n.Ts("globals.messages.required", "name", "`inbox_id`"), nil)
 	}

@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { postToParent } from '../parentBridge.js'
 
 export const useWidgetStore = defineStore('widget', () => {
     // State
@@ -34,7 +35,7 @@ export const useWidgetStore = defineStore('widget', () => {
             collapseWidget()
         }
         // Tell the parent loader to hide the iframe.
-        window.parent.postMessage({ type: 'CLOSE_WIDGET' }, '*')
+        postToParent({ type: 'CLOSE_WIDGET' })
     }
 
     const navigateToChat = () => {
@@ -93,14 +94,14 @@ export const useWidgetStore = defineStore('widget', () => {
     const expandWidget = () => {
         if (!isMobileFullScreen.value) {
             isExpanded.value = true
-            window.parent.postMessage({ type: 'EXPAND_WIDGET' }, '*')
+            postToParent({ type: 'EXPAND_WIDGET' })
         }
     }
 
     const collapseWidget = () => {
         if (!isMobileFullScreen.value) {
             isExpanded.value = false
-            window.parent.postMessage({ type: 'COLLAPSE_WIDGET' }, '*')
+            postToParent({ type: 'COLLAPSE_WIDGET' })
         }
     }
 

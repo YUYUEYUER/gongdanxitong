@@ -35,7 +35,8 @@
 
 <script setup>
 import { File } from 'lucide-vue-next';
-import { formatBytes, getThumbFilepath } from '@shared-ui/utils/file';
+import { downloadUrl, formatBytes, getThumbFilepath, isSafePreviewImage } from '@shared-ui/utils/file';
+import { openSafeExternalUrl } from '@shared-ui/utils/url.js'
 defineProps({
   attachments: {
     type: Array,
@@ -44,20 +45,20 @@ defineProps({
 })
 
 const isImage = (attachment) => {
-  return attachment.content_type && attachment.content_type.startsWith('image/')
+  return isSafePreviewImage(attachment)
 }
 
 const getThumbnailUrl = (attachment) => {
   if (!isImage(attachment)) return attachment.url
-  return getThumbFilepath(attachment.url)
+  return getThumbFilepath(attachment.thumbnail_url)
 }
 
 const openImage = (url) => {
-  window.open(url, '_blank', 'noopener,noreferrer')
+  openSafeExternalUrl(url)
 }
 
 const downloadFile = (attachment) => {
-  window.open(attachment.url, '_blank', 'noopener,noreferrer')
+  openSafeExternalUrl(downloadUrl(attachment.download_url || attachment.url))
 }
 
 const truncateFileName = (name) => {

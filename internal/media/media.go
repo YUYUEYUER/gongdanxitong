@@ -5,14 +5,16 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	"mime"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/abhinavxd/libredesk/internal/attachment"
 	"github.com/abhinavxd/libredesk/internal/dbutil"
 	"github.com/abhinavxd/libredesk/internal/envelope"
 	"github.com/abhinavxd/libredesk/internal/image"
@@ -28,7 +30,18 @@ import (
 
 var (
 	//go:embed queries.sql
-	efs embed.FS
+	efs                   embed.FS
+	ErrOwnerQuotaExceeded = errors.New("persistent media owner quota exceeded")
+)
+
+const (
+	MaxOwnedMediaFiles           = 500
+	MaxOwnedMediaBytes           = int64(1 << 30)
+	MaxUnlinkedMediaFiles        = int64(50)
+	MaxUnlinkedMediaBytes        = int64(100 << 20)
+	DefaultMaxInstanceMediaFiles = int64(100_000)
+	DefaultMaxInstanceMediaBytes = int64(50 << 30)
+	DefaultMinFreeStorageBytes   = int64(1 << 30)
 )
 
 // Store defines the interface for media storage operations.
@@ -43,6 +56,20 @@ type Store interface {
 	SignedURLValidator() func(name, sig string, exp int64) bool
 }
 
+// CapacityStore is implemented by stores that can report the physical free
+// space available to this application. Remote object stores generally enforce
+// capacity outside LibreDesk and rely on the database hard quota below.
+type CapacityStore interface {
+	AvailableBytes() (uint64, error)
+}
+
+// ReservedCapacityStore atomically checks a physical free-space reserve and
+// writes an object. Local filesystem storage implements this to avoid a
+// check-then-write race between concurrent uploads.
+type ReservedCapacityStore interface {
+	PutWithReserve(name, contentType string, content io.ReadSeeker, minFreeBytes uint64) (string, error)
+}
+
 // SignedURLStore defines the interface for stores that support signed URLs.
 // This is optional and only implemented by stores that need signed URL functionality (like fs).
 type SignedURLStore interface {
@@ -51,18 +78,25 @@ type SignedURLStore interface {
 }
 
 type Manager struct {
-	store   Store
-	lo      *logf.Logger
-	i18n    *i18n.I18n
-	queries queries
+	store            Store
+	lo               *logf.Logger
+	i18n             *i18n.I18n
+	db               *sqlx.DB
+	maxInstanceFiles int64
+	maxInstanceBytes int64
+	minFreeBytes     int64
+	queries          queries
 }
 
 // Opts provides options for configuring the Manager.
 type Opts struct {
-	Store Store
-	Lo    *logf.Logger
-	DB    *sqlx.DB
-	I18n  *i18n.I18n
+	Store             Store
+	Lo                *logf.Logger
+	DB                *sqlx.DB
+	I18n              *i18n.I18n
+	MaxInstanceFiles  int64
+	MaxInstanceBytes  int64
+	MinFreeStoreBytes int64
 }
 
 // New initializes and returns a new Manager instance for handling media operations.
@@ -71,26 +105,45 @@ func New(opt Opts) (*Manager, error) {
 	if err := dbutil.ScanSQLFile("queries.sql", &q, opt.DB, efs); err != nil {
 		return nil, err
 	}
+	if opt.MaxInstanceFiles <= 0 {
+		opt.MaxInstanceFiles = DefaultMaxInstanceMediaFiles
+	}
+	if opt.MaxInstanceBytes <= 0 {
+		opt.MaxInstanceBytes = DefaultMaxInstanceMediaBytes
+	}
+	if opt.MinFreeStoreBytes <= 0 {
+		opt.MinFreeStoreBytes = DefaultMinFreeStorageBytes
+	}
 	return &Manager{
-		store:   opt.Store,
-		lo:      opt.Lo,
-		i18n:    opt.I18n,
-		queries: q,
+		store:            opt.Store,
+		lo:               opt.Lo,
+		i18n:             opt.I18n,
+		db:               opt.DB,
+		maxInstanceFiles: opt.MaxInstanceFiles,
+		maxInstanceBytes: opt.MaxInstanceBytes,
+		minFreeBytes:     opt.MinFreeStoreBytes,
+		queries:          q,
 	}, nil
 }
 
 // queries holds the prepared SQL statements.
 type queries struct {
-	Insert                  *sqlx.Stmt `query:"insert-media"`
-	Get                     *sqlx.Stmt `query:"get-media"`
-	GetByUUID               *sqlx.Stmt `query:"get-media-by-uuid"`
-	Delete                  *sqlx.Stmt `query:"delete-media"`
-	Attach                  *sqlx.Stmt `query:"attach-to-model"`
-	GetByModel              *sqlx.Stmt `query:"get-model-media"`
-	GetUnlinkedMessageMedia *sqlx.Stmt `query:"get-unlinked-message-media"`
-	ContentIDExists         *sqlx.Stmt `query:"content-id-exists"`
-	GetByContentIDs         *sqlx.Stmt `query:"get-media-by-content-ids"`
-	SetContentID            *sqlx.Stmt `query:"set-media-content-id"`
+	Insert                *sqlx.Stmt `query:"insert-media"`
+	Get                   *sqlx.Stmt `query:"get-media"`
+	GetByUUID             *sqlx.Stmt `query:"get-media-by-uuid"`
+	Delete                *sqlx.Stmt `query:"delete-media"`
+	Attach                *sqlx.Stmt `query:"attach-to-model"`
+	GetByModel            *sqlx.Stmt `query:"get-model-media"`
+	GetUnlinkedMedia      *sqlx.Stmt `query:"get-unlinked-media"`
+	GetUnlinkedMediaUsage *sqlx.Stmt `query:"get-unlinked-media-usage"`
+	GetOwnedMediaUsage    *sqlx.Stmt `query:"get-owned-media-usage"`
+	GetGlobalMediaUsage   *sqlx.Stmt `query:"get-global-media-usage"`
+	LockMediaOwner        *sqlx.Stmt `query:"lock-media-owner"`
+	LockGlobalMediaQuota  *sqlx.Stmt `query:"lock-global-media-quota"`
+	ContentIDExists       *sqlx.Stmt `query:"content-id-exists"`
+	GetByContentIDs       *sqlx.Stmt `query:"get-media-by-content-ids"`
+	SetContentID          *sqlx.Stmt `query:"set-media-content-id"`
+	SetThumbnailSize      *sqlx.Stmt `query:"set-media-thumbnail-size"`
 }
 
 // UploadAndInsert uploads file on storage and inserts an entry in db.
@@ -105,13 +158,46 @@ func (m *Manager) UploadAndInsert(srcFilename, contentType, contentID string, mo
 	if err != nil {
 		return models.Media{}, err
 	}
+	thumbnailSize, hasThumbnailSize := thumbnailSizeFromMeta(meta)
+	if strings.HasPrefix(contentType, "image/") {
+		if !hasThumbnailSize {
+			meta = withThumbnailSizeMeta(meta, 0)
+			thumbnailSize = 0
+		}
+	} else {
+		thumbnailSize = 0
+	}
 
-	media, err := m.Insert(disposition, srcFilename, contentType, contentID, modelType, uuid.String(), modelID, ownerUserID, fileSize, meta)
+	media, err := m.Insert(disposition, srcFilename, contentType, contentID, modelType, uuid.String(), modelID, ownerUserID, fileSize, int64(fileSize)+thumbnailSize, meta)
 	if err != nil {
 		m.store.Delete(uuid.String())
 		return models.Media{}, err
 	}
 	return media, nil
+}
+
+func thumbnailSizeFromMeta(meta []byte) (int64, bool) {
+	var values struct {
+		ThumbnailSize *int64 `json:"thumbnail_size"`
+	}
+	if len(meta) == 0 || json.Unmarshal(meta, &values) != nil || values.ThumbnailSize == nil ||
+		*values.ThumbnailSize < 0 || *values.ThumbnailSize > image.ThumbnailStorageReserveBytes {
+		return 0, false
+	}
+	return *values.ThumbnailSize, true
+}
+
+func withThumbnailSizeMeta(meta []byte, thumbnailSize int64) []byte {
+	values := make(map[string]any)
+	if len(meta) > 0 {
+		_ = json.Unmarshal(meta, &values)
+	}
+	values["thumbnail_size"] = thumbnailSize
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return []byte(`{"thumbnail_size":0}`)
+	}
+	return encoded
 }
 
 // Upload saves the media file to the storage backend - returns the generated filename and content type (after detection).
@@ -125,8 +211,32 @@ func (m *Manager) Upload(fileName, contentType string, content io.ReadSeeker) (s
 		m.lo.Error("error detecting content type", "error", err, "file_name", fileName, "content_type", contentType, "store", m.store.Name())
 		return "", "", err
 	}
+	contentSize, err := content.Seek(0, io.SeekEnd)
+	if err != nil {
+		return "", "", envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.errorUploadingFile"), nil)
+	}
+	if _, err := content.Seek(0, io.SeekStart); err != nil {
+		return "", "", envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.errorUploadingFile"), nil)
+	}
+	if capacityStore, ok := m.store.(CapacityStore); ok {
+		available, err := capacityStore.AvailableBytes()
+		if err != nil {
+			m.lo.Error("error checking media store capacity", "error", err, "store", m.store.Name())
+			return "", "", envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.errorUploadingFile"), nil)
+		}
+		reserve := uint64(m.minFreeBytes)
+		required := uint64(contentSize)
+		if available <= reserve || required > available-reserve {
+			return "", "", envelope.NewErrorWithCode(envelope.GeneralError, 507, "Media storage capacity reached", nil)
+		}
+	}
 
-	fName, err := m.store.Put(fileName, contentType, content)
+	var fName string
+	if reservedStore, ok := m.store.(ReservedCapacityStore); ok {
+		fName, err = reservedStore.PutWithReserve(fileName, contentType, content, uint64(m.minFreeBytes))
+	} else {
+		fName, err = m.store.Put(fileName, contentType, content)
+	}
 	if err != nil {
 		m.lo.Error("error uploading media to store", "error", err, "file_name", fileName, "content_type", contentType, "store", m.store.Name())
 		return "", "", envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.errorUploadingFile"), nil)
@@ -135,10 +245,71 @@ func (m *Manager) Upload(fileName, contentType string, content io.ReadSeeker) (s
 }
 
 // Insert inserts media details into the database and returns the inserted media record.
-func (m *Manager) Insert(disposition null.String, fileName, contentType, contentID string, modelType null.String, uuid string, modelID, ownerUserID null.Int, fileSize int, meta []byte) (models.Media, error) {
+func (m *Manager) Insert(disposition null.String, fileName, contentType, contentID string, modelType null.String, uuid string, modelID, ownerUserID null.Int, fileSize int, storageSize int64, meta []byte) (models.Media, error) {
+	if fileSize < 0 || storageSize < int64(fileSize) || !ownerUserID.Valid || ownerUserID.Int <= 0 {
+		return models.Media{}, envelope.NewError(envelope.InputError, m.i18n.T("globals.messages.badRequest"), nil)
+	}
+	return m.insertWithQuotas(disposition, fileName, contentType, contentID, modelType, uuid, modelID, ownerUserID, fileSize, storageSize, meta)
+}
+
+func (m *Manager) insertWithQuotas(disposition null.String, fileName, contentType, contentID string, modelType null.String, uuid string, modelID, ownerUserID null.Int, fileSize int, storageSize int64, meta []byte) (models.Media, error) {
+	tx, err := m.db.Beginx()
+	if err != nil {
+		m.lo.Error("error beginning media quota transaction", "error", err)
+		return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Stmtx(m.queries.LockGlobalMediaQuota).Exec(); err != nil {
+		m.lo.Error("error locking global media quota", "error", err)
+		return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	var globalCount, globalBytes int64
+	if err := tx.Stmtx(m.queries.GetGlobalMediaUsage).QueryRow().Scan(&globalCount, &globalBytes); err != nil {
+		m.lo.Error("error fetching global media usage", "error", err)
+		return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	storageObjects := int64(1)
+	if storageSize > int64(fileSize) {
+		storageObjects++
+	}
+	if !withinMediaQuota(globalCount, globalBytes, storageObjects, storageSize, m.maxInstanceFiles, m.maxInstanceBytes) {
+		return models.Media{}, envelope.NewErrorWithCode(envelope.InputError, 413, "Instance media storage quota exceeded", nil)
+	}
+
+	if ownerUserID.Valid && ownerUserID.Int > 0 {
+		var lockedOwnerID int
+		if err := tx.Stmtx(m.queries.LockMediaOwner).Get(&lockedOwnerID, ownerUserID.Int); err != nil {
+			m.lo.Warn("invalid media owner", "owner_user_id", ownerUserID.Int, "error", err)
+			return models.Media{}, envelope.NewError(envelope.PermissionError, m.i18n.T("status.deniedPermission"), nil)
+		}
+		var count, usedBytes int64
+		if err := tx.Stmtx(m.queries.GetOwnedMediaUsage).QueryRow(ownerUserID.Int).Scan(&count, &usedBytes); err != nil {
+			m.lo.Error("error fetching persistent media usage", "owner_user_id", ownerUserID.Int, "error", err)
+			return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+		}
+		if !withinOwnedMediaQuota(count, usedBytes, storageSize) {
+			return models.Media{}, envelope.NewErrorWithCode(envelope.InputError, 413, "Persistent upload quota exceeded", nil)
+		}
+		if !modelID.Valid || modelID.Int <= 0 {
+			var unlinkedCount, unlinkedBytes int64
+			if err := tx.Stmtx(m.queries.GetUnlinkedMediaUsage).QueryRow(ownerUserID.Int).Scan(&unlinkedCount, &unlinkedBytes); err != nil {
+				m.lo.Error("error fetching unlinked media usage", "owner_user_id", ownerUserID.Int, "error", err)
+				return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+			}
+			if !withinMediaQuota(unlinkedCount, unlinkedBytes, 1, storageSize, MaxUnlinkedMediaFiles, MaxUnlinkedMediaBytes) {
+				return models.Media{}, envelope.NewErrorWithCode(envelope.InputError, 413, "Unattached upload quota exceeded", nil)
+			}
+		}
+	}
+
 	var id int
-	if err := m.queries.Insert.QueryRow(m.store.Name(), fileName, contentType, fileSize, meta, modelID, modelType, disposition, contentID, uuid, ownerUserID).Scan(&id); err != nil {
-		m.lo.Error("error inserting media", "error", err, "file_name", fileName, "content_type", contentType, "store", m.store.Name())
+	if err := tx.Stmtx(m.queries.Insert).QueryRow(m.store.Name(), fileName, contentType, fileSize, meta, modelID, modelType, disposition, contentID, uuid, ownerUserID).Scan(&id); err != nil {
+		m.lo.Error("error inserting media", "error", err, "file_name", fileName, "owner_user_id", ownerUserID.Int)
+		return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	if err := tx.Commit(); err != nil {
+		m.lo.Error("error committing media quota transaction", "error", err)
 		return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	return m.Get(id, "")
@@ -157,6 +328,80 @@ func (m *Manager) GetMany(ids []int) ([]models.Media, error) {
 	return out, nil
 }
 
+// GetUnlinkedUsage returns the number and total bytes of uploads owned by a
+// user that have not yet been attached to a model.
+func (m *Manager) GetUnlinkedUsage(ownerUserID int) (int64, int64, error) {
+	var count, bytes int64
+	if ownerUserID <= 0 {
+		return 0, 0, fmt.Errorf("invalid media owner")
+	}
+	if err := m.queries.GetUnlinkedMediaUsage.QueryRow(ownerUserID).Scan(&count, &bytes); err != nil {
+		m.lo.Error("error fetching unlinked media usage", "owner_user_id", ownerUserID, "error", err)
+		return 0, 0, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	return count, bytes, nil
+}
+
+// GetOwnedUsage includes linked and unlinked media so attaching a file never
+// resets the owner's persistent storage budget.
+func (m *Manager) GetOwnedUsage(ownerUserID int) (int64, int64, error) {
+	var count, bytes int64
+	if ownerUserID <= 0 {
+		return 0, 0, fmt.Errorf("invalid media owner")
+	}
+	if err := m.queries.GetOwnedMediaUsage.QueryRow(ownerUserID).Scan(&count, &bytes); err != nil {
+		m.lo.Error("error fetching persistent media usage", "owner_user_id", ownerUserID, "error", err)
+		return 0, 0, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	return count, bytes, nil
+}
+
+func (m *Manager) CanStoreForOwner(ownerUserID int, nextBytes int64) (bool, error) {
+	globalCount, globalBytes, err := m.GetGlobalUsage()
+	if err != nil {
+		return false, err
+	}
+	if !withinMediaQuota(globalCount, globalBytes, 1, nextBytes, m.maxInstanceFiles, m.maxInstanceBytes) {
+		return false, nil
+	}
+	count, usedBytes, err := m.GetOwnedUsage(ownerUserID)
+	if err != nil {
+		return false, err
+	}
+	return withinOwnedMediaQuota(count, usedBytes, nextBytes), nil
+}
+
+// GetGlobalUsage includes rows with no owner so e-mail and rotating anonymous
+// identities cannot bypass the instance storage boundary.
+func (m *Manager) GetGlobalUsage() (int64, int64, error) {
+	var count, bytes int64
+	if err := m.queries.GetGlobalMediaUsage.QueryRow().Scan(&count, &bytes); err != nil {
+		m.lo.Error("error fetching global media usage", "error", err)
+		return 0, 0, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	return count, bytes, nil
+}
+
+func withinMediaQuota(count, usedBytes, nextFiles, nextBytes, maxFiles, maxBytes int64) bool {
+	if count < 0 || usedBytes < 0 || nextFiles <= 0 || nextBytes < 0 || maxFiles <= 0 || maxBytes <= 0 || count > maxFiles || usedBytes > maxBytes {
+		return false
+	}
+	return nextFiles <= maxFiles-count && nextBytes <= maxBytes-usedBytes
+}
+
+func withinOwnedMediaQuota(count, usedBytes, nextBytes int64) bool {
+	if count < 0 || usedBytes < 0 || nextBytes < 0 || count >= MaxOwnedMediaFiles || usedBytes > MaxOwnedMediaBytes {
+		return false
+	}
+	return nextBytes <= MaxOwnedMediaBytes-usedBytes
+}
+
+// OwnedMediaUsageWithinLimits is used when ownership is transferred without
+// creating a new file, such as visitor-to-contact merges.
+func OwnedMediaUsageWithinLimits(count, usedBytes int64) bool {
+	return count >= 0 && usedBytes >= 0 && count <= MaxOwnedMediaFiles && usedBytes <= MaxOwnedMediaBytes
+}
+
 // Get retrieves the media record by its ID and returns the media.
 func (m *Manager) Get(id int, uuid string) (models.Media, error) {
 	var media models.Media
@@ -167,8 +412,67 @@ func (m *Manager) Get(id int, uuid string) (models.Media, error) {
 		m.lo.Error("error fetching media", "error", err)
 		return media, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
-	media.URL = m.GetURL(media.UUID, media.ContentType, media.Filename)
+	media.URL, media.DownloadURL, media.ThumbnailURL = m.GetAttachmentURLs(media.UUID, media.ContentType, media.Filename)
+	if !ThumbnailAvailable(media.Meta, media.ContentType) {
+		media.ThumbnailURL = ""
+	}
 	return media, nil
+}
+
+// GetAttachmentURLs returns separately signed preview, download and thumbnail
+// URLs. Callers must not derive one storage URL from another because both FS
+// and S3 signatures bind the object name and/or response parameters.
+func (m *Manager) GetAttachmentURLs(uuid, contentType, fileName string) (string, string, string) {
+	previewURL := m.GetURL(uuid, contentType, fileName)
+	downloadURL := m.GetURLForDownload(uuid, fileName)
+	thumbnailURL := ""
+	if isThumbnailMediaContentType(contentType) {
+		thumbnailURL = m.store.GetURL(image.ThumbPrefix+uuid, "inline", "thumbnail-"+fileName)
+	}
+	return previewURL, downloadURL, thumbnailURL
+}
+
+func isThumbnailMediaContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(mediaType) {
+	case "image/png", "image/jpeg", "image/gif":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) DecorateAttachment(item *attachment.Attachment) {
+	if item == nil || item.UUID == "" {
+		return
+	}
+	item.URL, item.DownloadURL, item.ThumbnailURL = m.GetAttachmentURLs(item.UUID, item.ContentType, item.Name)
+	if !item.ThumbnailAvailable {
+		item.ThumbnailURL = ""
+	}
+}
+
+func ThumbnailAvailable(meta json.RawMessage, contentType string) bool {
+	var values struct {
+		ThumbnailSize *int64 `json:"thumbnail_size"`
+	}
+	if json.Unmarshal(meta, &values) == nil && values.ThumbnailSize != nil {
+		return *values.ThumbnailSize > 0 && *values.ThumbnailSize <= image.ThumbnailStorageReserveBytes
+	}
+	return isThumbnailMediaContentType(contentType)
+}
+
+func (m *Manager) SetThumbnailSize(id int, thumbnailSize int64) error {
+	if id <= 0 || thumbnailSize < 0 || thumbnailSize > image.ThumbnailStorageReserveBytes {
+		return fmt.Errorf("invalid thumbnail accounting update")
+	}
+	if _, err := m.queries.SetThumbnailSize.Exec(id, thumbnailSize); err != nil {
+		return fmt.Errorf("updating thumbnail accounting: %w", err)
+	}
+	return nil
 }
 
 // SetContentID stamps a content_id onto a media row if one isn't already set.
@@ -216,15 +520,25 @@ func (m *Manager) GetBlob(name string) ([]byte, error) {
 
 // GetURL returns the URL for accessing a media file by its name.
 func (m *Manager) GetURL(uuid, contentType, fileName string) string {
-	// Keep some content types inline. SVG excluded.
 	disposition := "attachment"
-	if contentType != "image/svg+xml" &&
-		(strings.HasPrefix(contentType, "image/") ||
-			strings.HasPrefix(contentType, "video/") ||
-			contentType == "application/pdf") {
+	if safeInlineMediaContentType(contentType) {
 		disposition = "inline"
 	}
 	return m.store.GetURL(uuid, disposition, fileName)
+}
+
+func safeInlineMediaContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(mediaType) {
+	case "image/png", "image/jpeg", "image/gif",
+		"video/mp4", "video/webm", "video/ogg", "application/pdf":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) GetURLForDownload(uuid, fileName string) string {
@@ -289,26 +603,26 @@ func (m *Manager) Delete(name string) error {
 	return nil
 }
 
-// DeleteUnlinkedMedia is a blocking function that periodically deletes media files that are not linked to any conversation message.
+// DeleteUnlinkedMedia periodically deletes stale media not linked to any model.
 func (m *Manager) DeleteUnlinkedMedia(ctx context.Context) {
-	m.deleteUnlinkedMessageMedia()
+	m.deleteUnlinkedMedia()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(12 * time.Hour):
 			m.lo.Info("starting periodic deletion of unlinked media")
-			if err := m.deleteUnlinkedMessageMedia(); err != nil {
+			if err := m.deleteUnlinkedMedia(); err != nil {
 				m.lo.Error("error deleting unlinked media", "error", err)
 			}
 		}
 	}
 }
 
-// deleteUnlinkedMessageMedia fetches all media files that are not linked to any message and deletes them from the storage backend and the database.
-func (m *Manager) deleteUnlinkedMessageMedia() error {
+// deleteUnlinkedMedia fetches all stale media not linked to any model.
+func (m *Manager) deleteUnlinkedMedia() error {
 	var media []models.Media
-	if err := m.queries.GetUnlinkedMessageMedia.Select(&media); err != nil {
+	if err := m.queries.GetUnlinkedMedia.Select(&media); err != nil {
 		m.lo.Error("error fetching unlinked media", "error", err)
 		return err
 	}
@@ -331,52 +645,29 @@ func (m *Manager) deleteUnlinkedMessageMedia() error {
 	return nil
 }
 
-// detectContentType detects the content type of a file.
-// It trusts the source content type unless it's a generic type like application/octet-stream.
-// For generic types, it uses http.DetectContentType (stdlib) as a fast path,
-// falling back to mimetype library for deeper inspection using magic numbers.
+// detectContentType detects the content type from bytes. The source value is
+// used only for diagnostics because it is controlled by the uploader.
 func (m *Manager) detectContentType(sourceContentType string, content io.ReadSeeker) (string, error) {
-	// Set default if empty
-	if sourceContentType == "" {
-		sourceContentType = "application/octet-stream"
-	}
-
-	// Trust source unless it's a generic/useless type
-	if sourceContentType != "application/octet-stream" &&
-		sourceContentType != "application/data" &&
-		sourceContentType != "application/binary" {
-		m.lo.Debug("detected media content type from trusted source", "detected_type", sourceContentType)
-		return sourceContentType, nil
-	}
-
-	// Ensure we're at the start
-	content.Seek(0, io.SeekStart)
-
-	// Fast path: stdlib
-	buf := make([]byte, 512)
-	n, _ := content.Read(buf)
-	detected := http.DetectContentType(buf[:n])
-
-	// If stdlib gives a useful type, use it.
-	// stdlib defaults to application/octet-stream for unknown types.
-	if detected != "application/octet-stream" {
-		content.Seek(0, io.SeekStart)
-		m.lo.Debug("detected media content type using stdlib", "detected_type", detected, "source_type", sourceContentType)
-		return detected, nil
-	}
-
-	// Slow path: mimetype library
-	content.Seek(0, io.SeekStart)
-	mtype, err := mimetype.DetectReader(content)
+	detected, err := sniffContentType(content)
 	if err != nil {
 		m.lo.Error("error detecting content type", "error", err)
-		content.Seek(0, io.SeekStart)
-		return sourceContentType, nil
+		return "", err
 	}
+	m.lo.Debug("detected media content type from content", "detected_type", detected, "source_type", sourceContentType)
+	return detected, nil
+}
 
-	detectedType := mtype.String()
-	m.lo.Debug("detected media content type using mimetype lib", "detected_type", detectedType, "source_type", sourceContentType)
-
-	content.Seek(0, io.SeekStart)
-	return detectedType, nil
+func sniffContentType(content io.ReadSeeker) (string, error) {
+	if _, err := content.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("seeking media: %w", err)
+	}
+	defer content.Seek(0, io.SeekStart)
+	mtype, err := mimetype.DetectReader(content)
+	if err != nil {
+		return "", fmt.Errorf("detecting media type: %w", err)
+	}
+	if detected := mtype.String(); detected != "" {
+		return detected, nil
+	}
+	return "application/octet-stream", nil
 }

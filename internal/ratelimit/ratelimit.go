@@ -3,11 +3,12 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	realip "github.com/ferluci/fast-realip"
 	"github.com/redis/go-redis/v9"
 	"github.com/valyala/fasthttp"
 )
@@ -21,8 +22,9 @@ type Rule struct {
 
 // Limiter handles rate limiting using Redis.
 type Limiter struct {
-	redis *redis.Client
-	rules map[string]Rule
+	redis          *redis.Client
+	rules          map[string]Rule
+	trustedProxies []netip.Prefix
 }
 
 var windowMemberSeq atomic.Uint64
@@ -42,6 +44,88 @@ func New(redisClient *redis.Client) *Limiter {
 	}
 }
 
+// SetTrustedProxies configures the only network peers whose forwarding headers
+// may influence client IP resolution.
+func (l *Limiter) SetTrustedProxies(cidrs []string) error {
+	prefixes := make([]netip.Prefix, 0, len(cidrs))
+	for _, raw := range cidrs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			addr, addrErr := netip.ParseAddr(raw)
+			if addrErr != nil {
+				return fmt.Errorf("invalid trusted proxy %q: %w", raw, err)
+			}
+			bits := 128
+			if addr.Is4() {
+				bits = 32
+			}
+			prefix = netip.PrefixFrom(addr, bits)
+		}
+		if prefix.Bits() == 0 {
+			return fmt.Errorf("trusted proxy %q is too broad", raw)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	l.trustedProxies = prefixes
+	return nil
+}
+
+// ClientIP returns the socket peer unless that peer is explicitly trusted. For
+// trusted peers it walks X-Forwarded-For from right to left and stops at the
+// first untrusted hop. X-Client-IP is intentionally ignored.
+func (l *Limiter) ClientIP(ctx *fasthttp.RequestCtx) string {
+	remote, ok := netip.AddrFromSlice(ctx.RemoteIP())
+	if !ok {
+		return "unknown"
+	}
+	remote = remote.Unmap()
+	if l == nil {
+		return remote.String()
+	}
+	if !l.isTrustedProxy(remote) {
+		return remote.String()
+	}
+
+	if raw := strings.TrimSpace(string(ctx.Request.Header.Peek("X-Forwarded-For"))); raw != "" {
+		chain := strings.Split(raw, ",")
+		if len(chain) > 32 {
+			return remote.String()
+		}
+		current := remote
+		for i := len(chain) - 1; i >= 0 && l.isTrustedProxy(current); i-- {
+			next, err := netip.ParseAddr(strings.TrimSpace(chain[i]))
+			if err != nil {
+				return remote.String()
+			}
+			current = next.Unmap()
+		}
+		return current.String()
+	}
+
+	if raw := strings.TrimSpace(string(ctx.Request.Header.Peek("X-Real-IP"))); raw != "" {
+		if addr, err := netip.ParseAddr(raw); err == nil {
+			return addr.Unmap().String()
+		}
+	}
+	return remote.String()
+}
+
+func (l *Limiter) isTrustedProxy(addr netip.Addr) bool {
+	if l == nil {
+		return false
+	}
+	for _, prefix := range l.trustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 // AddRule registers a named rate limiting rule.
 func (l *Limiter) AddRule(rule Rule) {
 	l.rules[rule.Name] = rule
@@ -49,12 +133,21 @@ func (l *Limiter) AddRule(rule Rule) {
 
 // Check checks if the request should be rate limited for the given rule.
 func (l *Limiter) Check(ctx *fasthttp.RequestCtx, ruleName string) error {
+	if l == nil {
+		return fmt.Errorf("rate limiter is unavailable")
+	}
 	rule, ok := l.rules[ruleName]
-	if !ok || !rule.Enabled {
+	if !ok {
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+		ctx.SetBodyString(`{"status":"error","message":"Rate limiting temporarily unavailable"}`)
+		return fmt.Errorf("rate limit rule %q is not configured", ruleName)
+	}
+	if !rule.Enabled {
 		return nil
 	}
 
-	clientIP := realip.FromRequest(ctx)
+	clientIP := l.ClientIP(ctx)
 	key := fmt.Sprintf("rate_limit:%s:%s", ruleName, clientIP)
 
 	now := time.Now()
@@ -63,13 +156,22 @@ func (l *Limiter) Check(ctx *fasthttp.RequestCtx, ruleName string) error {
 	windowStart := strconv.FormatInt(nowUnix-60, 10)
 
 	// Single pipeline: cleanup, add, count, set expiry.
+	if l.redis == nil {
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+		ctx.SetBodyString(`{"status":"error","message":"Rate limiting temporarily unavailable"}`)
+		return fmt.Errorf("rate limit backend unavailable")
+	}
 	pipe := l.redis.Pipeline()
 	pipe.ZRemRangeByScore(ctx, key, "-inf", windowStart)
-	pipe.ZAdd(ctx, key, redis.Z{Score: float64(nowUnix), Member: nowNano})
+	pipe.ZAdd(ctx, key, redis.Z{Score: float64(nowUnix), Member: fmt.Sprintf("%d:%d", nowNano, windowMemberSeq.Add(1))})
 	countCmd := pipe.ZCard(ctx, key)
 	pipe.Expire(ctx, key, time.Minute*2)
 	if _, err := pipe.Exec(ctx); err != nil {
-		return nil
+		ctx.Response.Header.Set("Content-Type", "application/json")
+		ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+		ctx.SetBodyString(`{"status":"error","message":"Rate limiting temporarily unavailable"}`)
+		return fmt.Errorf("rate limit backend unavailable: %w", err)
 	}
 
 	count := countCmd.Val()
@@ -99,8 +201,11 @@ func (l *Limiter) CheckWindow(ctx context.Context, key string, window time.Durat
 		Limit:     maxAttempts,
 		Remaining: max(maxAttempts-1, 0),
 	}
-	if l == nil || l.redis == nil || key == "" || window <= 0 || maxAttempts <= 0 {
+	if key == "" || window <= 0 || maxAttempts <= 0 {
 		return result, nil
+	}
+	if l == nil || l.redis == nil {
+		return result, fmt.Errorf("rate limit backend unavailable")
 	}
 
 	now := time.Now()

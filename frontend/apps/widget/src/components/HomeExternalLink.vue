@@ -1,5 +1,5 @@
 <template>
-  <a :href="link.url" target="_blank" rel="noopener noreferrer" class="block no-underline">
+  <a :href="safeUrl" target="_blank" rel="noopener noreferrer" class="block no-underline">
     <Card class="hover:bg-accent transition-colors cursor-pointer rounded-md">
       <CardContent class="p-4">
         <div class="flex justify-between items-center">
@@ -14,13 +14,17 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import { Card, CardContent } from '@shared-ui/components/ui/card'
 import { ExternalLink } from 'lucide-vue-next'
+import { sanitizeHttpUrl } from '@shared-ui/utils/url.js'
 
-defineProps({
+const props = defineProps({
   link: {
     type: Object,
     required: true
   }
 })
+
+const safeUrl = computed(() => sanitizeHttpUrl(props.link.url) || '#')
 </script>

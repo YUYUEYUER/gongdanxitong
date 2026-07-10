@@ -1,7 +1,7 @@
 -- name: insert
 INSERT INTO csat_responses (conversation_id)
-SELECT $1
-WHERE NOT EXISTS (SELECT 1 FROM csat_responses WHERE conversation_id = $1)
+VALUES ($1)
+ON CONFLICT (conversation_id) DO NOTHING
 RETURNING uuid;
 
 -- name: get
@@ -23,4 +23,4 @@ SET rating = $2,
     feedback = $3,
     meta = COALESCE($4::jsonb, '{}'),
     response_timestamp = NOW()
-WHERE uuid = $1;
+WHERE uuid = $1 AND response_timestamp IS NULL;

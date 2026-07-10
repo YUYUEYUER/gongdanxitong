@@ -4,6 +4,7 @@ package email
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ type Email struct {
 	smtpCfg              []models.SMTPConfig
 	imapCfg              []models.IMAPConfig
 	resendCfg            *models.ResendConfig
+	resendHTTPClient     *http.Client
 	oauth                *models.OAuthConfig
 	oauthMu              sync.RWMutex
 	authType             string
@@ -41,6 +43,11 @@ type Email struct {
 	enablePlusAddressing bool
 	messageStore         inbox.MessageStore
 	userStore            inbox.UserStore
+	imapCursorMu         sync.Mutex
+	imapCursors          map[string]uint32
+	imapIngressMu        sync.Mutex
+	imapIngressEvents    map[string][]imapIngressEvent
+	imapIngressLastSweep time.Time
 	wg                   sync.WaitGroup
 	tokenRefreshCallback TokenRefreshCallback
 }
@@ -75,6 +82,14 @@ func New(store inbox.MessageStore, userStore inbox.UserStore, opts Opts) (*Email
 		}
 	}
 
+	var resendHTTPClient *http.Client
+	if outboundProvider == models.OutboundProviderResend && opts.Config.Resend != nil {
+		resendHTTPClient, err = newResendHTTPClient(opts.Config.Resend.APIURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Resend API URL: %w", err)
+		}
+	}
+
 	var poolsToken string
 	if opts.Config.OAuth != nil {
 		poolsToken = opts.Config.OAuth.AccessToken
@@ -90,11 +105,14 @@ func New(store inbox.MessageStore, userStore inbox.UserStore, opts Opts) (*Email
 		smtpCfg:              opts.Config.SMTP,
 		imapCfg:              opts.Config.IMAP,
 		resendCfg:            opts.Config.Resend,
+		resendHTTPClient:     resendHTTPClient,
 		lo:                   opts.Lo,
 		smtpPools:            pools,
 		smtpPoolsToken:       poolsToken,
 		messageStore:         store,
 		userStore:            userStore,
+		imapCursors:          make(map[string]uint32),
+		imapIngressEvents:    make(map[string][]imapIngressEvent),
 		oauth:                opts.Config.OAuth,
 		authType:             opts.Config.AuthType,
 		outboundProvider:     outboundProvider,

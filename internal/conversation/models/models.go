@@ -399,12 +399,15 @@ func (m *Message) CensorCSATContentWithStatus(csatSubmitted bool, csatUUID strin
 	}
 }
 
-// StripCSATUUID removes the csat_uuid from the message meta.
-// Used to hide CSAT links from agent sessions while keeping them for API key callers.
+// StripCSATUUID removes the public survey token from an agent-facing message.
 func (m *Message) StripCSATUUID() {
 	var meta map[string]any
 	if err := json.Unmarshal([]byte(m.Meta), &meta); err != nil {
 		return
+	}
+	if isCsat, _ := meta["is_csat"].(bool); isCsat {
+		m.Content = "Please rate this conversation"
+		m.TextContent = m.Content
 	}
 	delete(meta, "csat_uuid")
 	if updatedMeta, err := json.Marshal(meta); err == nil {

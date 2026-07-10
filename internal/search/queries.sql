@@ -33,7 +33,9 @@ SELECT
 FROM conversation_messages m
     JOIN conversations c ON m.conversation_id = c.id
     LEFT JOIN conversation_statuses cs ON c.status_id = cs.id
-WHERE m.type != 'activity' and m.text_content ILIKE '%' || $1 || '%'
+WHERE m.type != 'activity'
+  AND lower(COALESCE(m.meta->>'is_csat', 'false')) <> 'true'
+  AND m.text_content ILIKE '%' || $1 || '%'
 LIMIT 30;
 
 -- name: search-contacts

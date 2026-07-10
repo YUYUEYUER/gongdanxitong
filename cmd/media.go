@@ -2,10 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"slices"
 
@@ -21,6 +25,13 @@ import (
 	"github.com/zerodha/fastglue"
 )
 
+const (
+	maxUnlinkedUploadsPerUser = 50
+	maxUnlinkedUploadBytes    = int64(100 << 20)
+	mediaUploadWindow         = 10 * time.Minute
+	maxMediaUploadsPerWindow  = 30
+)
+
 // handleMediaUpload handles media uploads.
 func handleMediaUpload(r *fastglue.Request) error {
 	var (
@@ -31,6 +42,19 @@ func handleMediaUpload(r *fastglue.Request) error {
 
 	if user, ok := r.RequestCtx.UserValue("user").(amodels.User); ok && user.ID > 0 {
 		ownerUserID = null.IntFrom(user.ID)
+	}
+	if !ownerUserID.Valid {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, app.i18n.T("status.deniedPermission"), nil, envelope.UnauthorizedError)
+	}
+
+	limit, err := app.rateLimit.CheckWindow(r.RequestCtx, fmt.Sprintf("media_upload:user:%d", ownerUserID.Int), mediaUploadWindow, maxMediaUploadsPerWindow)
+	if err != nil {
+		app.lo.Error("media upload rate limit unavailable", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
+	}
+	if !limit.Allowed {
+		r.RequestCtx.Response.Header.Set("Retry-After", strconv.Itoa(int(limit.RetryAfter.Seconds())))
+		return r.SendErrorEnvelope(fasthttp.StatusTooManyRequests, "Too many uploads", nil, envelope.InputError)
 	}
 
 	form, err := r.RequestCtx.MultipartForm()
@@ -59,13 +83,6 @@ func handleMediaUpload(r *fastglue.Request) error {
 		disposition = null.StringFrom(attachment.DispositionInline)
 	}
 
-	// Linked model?
-	var linkedModel string
-	model, ok := form.Value["linked_model"]
-	if ok && len(model) > 0 {
-		linkedModel = model[0]
-	}
-
 	// Sanitize filename.
 	srcFileName := stringutil.SanitizeFilename(fileHeader.Filename)
 	srcContentType := fileHeader.Header.Get("Content-Type")
@@ -90,6 +107,21 @@ func handleMediaUpload(r *fastglue.Request) error {
 		)
 	}
 
+	unlinkedCount, unlinkedBytes, err := app.media.GetUnlinkedUsage(ownerUserID.Int)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if !withinUnlinkedUploadQuota(unlinkedCount, unlinkedBytes, srcFileSize) {
+		return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, "Unattached upload quota exceeded", nil, envelope.InputError)
+	}
+	canStore, err := app.media.CanStoreForOwner(ownerUserID.Int, srcFileSize)
+	if err != nil {
+		return sendErrorEnvelope(r, err)
+	}
+	if !canStore {
+		return r.SendErrorEnvelope(fasthttp.StatusRequestEntityTooLarge, "Persistent upload quota exceeded", nil, envelope.InputError)
+	}
+
 	if !slices.Contains(consts.AllowedUploadFileExtensions, "*") && !slices.Contains(consts.AllowedUploadFileExtensions, srcExt) {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("media.fileTypeNotAllowed"), nil, envelope.InputError)
 	}
@@ -99,36 +131,41 @@ func handleMediaUpload(r *fastglue.Request) error {
 	thumbName := image.ThumbPrefix + uuid.String()
 	defer func() {
 		if cleanUp {
-			app.media.Delete(uuid.String())
-			app.media.Delete(thumbName)
+			if err := app.media.Delete(uuid.String()); err != nil {
+				app.lo.Error("error cleaning up uploaded media", "uuid", uuid.String(), "error", err)
+			}
+			if err := app.media.Delete(thumbName); err != nil {
+				app.lo.Error("error cleaning up uploaded thumbnail", "uuid", thumbName, "error", err)
+			}
 		}
 	}()
 
 	// Generate and upload thumbnail and store image dimensions in the media meta.
-	var meta = []byte("{}")
-	if slices.Contains(image.Exts, srcExt) && image.IsImageByContent(file) {
+	var (
+		meta          = []byte("{}")
+		thumbnailSize int64
+	)
+	if image.IsImageByContent(file) {
 		file.Seek(0, 0)
-		thumbFile, err := image.CreateThumb(image.DefThumbSize, file)
-		if err != nil {
+		thumbFile, width, height, err := image.CreateThumbWithDimensions(image.DefThumbSize, file)
+		if err != nil && !errors.Is(err, image.ErrThumbnailBusy) {
 			app.lo.Error("error creating thumb image", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.somethingWentWrong"), nil, envelope.GeneralError)
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("media.fileTypeNotAllowed"), nil, envelope.InputError)
 		}
-		thumbName, _, err = app.media.Upload(thumbName, srcContentType, thumbFile)
-		if err != nil {
-			return sendErrorEnvelope(r, err)
+		if thumbFile != nil {
+			thumbnailSize = thumbFile.Size()
+			thumbName, _, err = app.media.Upload(thumbName, srcContentType, thumbFile)
+			if err != nil {
+				return sendErrorEnvelope(r, err)
+			}
+		} else {
+			app.lo.Warn("thumbnail capacity reached; storing original without thumbnail")
 		}
 
-		// Store image dimensions in media meta, storing dimensions for image previews in future.
-		file.Seek(0, 0)
-		width, height, err := image.GetDimensions(file)
-		if err != nil {
-			cleanUp = true
-			app.lo.Error("error getting image dimensions", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, app.i18n.T("globals.messages.errorUploadingFile"), nil, envelope.GeneralError)
-		}
 		meta, _ = json.Marshal(map[string]interface{}{
-			"width":  width,
-			"height": height,
+			"width":          width,
+			"height":         height,
+			"thumbnail_size": thumbnailSize,
 		})
 	}
 
@@ -149,11 +186,12 @@ func handleMediaUpload(r *fastglue.Request) error {
 		srcFileName,
 		srcContentType,
 		"", /**content_id**/
-		null.NewString(linkedModel, linkedModel != ""),
+		null.StringFrom(mmodels.ModelMessages),
 		uuid.String(),
 		null.Int{}, /**model_id**/
 		ownerUserID,
 		int(srcFileSize),
+		srcFileSize+thumbnailSize,
 		meta,
 	)
 	if err != nil {
@@ -237,12 +275,7 @@ func serveMediaFile(r *fastglue.Request, app *App, uuid string, media *mmodels.M
 	case "fs":
 		disposition := "attachment"
 
-		// Inline images/videos/pdfs. SVG excluded.
-		if !forceDownload &&
-			media.ContentType != "image/svg+xml" &&
-			(strings.HasPrefix(media.ContentType, "image/") ||
-				strings.HasPrefix(media.ContentType, "video/") ||
-				media.ContentType == "application/pdf") {
+		if !forceDownload && safeInlineMediaType(media.ContentType) {
 			disposition = "inline"
 		}
 
@@ -261,9 +294,33 @@ func serveMediaFile(r *fastglue.Request, app *App, uuid string, media *mmodels.M
 	return nil
 }
 
+func safeInlineMediaType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(mediaType) {
+	case "image/png", "image/jpeg", "image/gif",
+		"video/mp4", "video/webm", "video/ogg":
+		return true
+	default:
+		return false
+	}
+}
+
 // bytesToMegabytes converts bytes to megabytes.
 func bytesToMegabytes(bytes int64) float64 {
 	return float64(bytes) / 1024 / 1024
+}
+
+func withinUnlinkedUploadQuota(count, usedBytes, nextBytes int64) bool {
+	if count < 0 || usedBytes < 0 || nextBytes <= 0 {
+		return false
+	}
+	if count >= maxUnlinkedUploadsPerUser || usedBytes > maxUnlinkedUploadBytes {
+		return false
+	}
+	return nextBytes <= maxUnlinkedUploadBytes-usedBytes
 }
 
 // getUnassociatedMedia fetches media by IDs, skipping any already associated with a model.

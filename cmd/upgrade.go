@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"github.com/knadh/stuffbin"
 	"golang.org/x/mod/semver"
 )
+
+const migrationAdvisoryLockID int64 = 128026298704194
 
 // migFunc represents a migration function for a particular version.
 // fn (generally) executes database migrations and additionally
@@ -50,6 +53,7 @@ var migList = []migFunc{
 	{"v2.4.0", migrations.V2_4_0},
 	{"v2.5.0", migrations.V2_5_0},
 	{"v2.5.1", migrations.V2_5_1},
+	{"v2.5.2", migrations.V2_5_2},
 }
 
 // upgrade upgrades the database to the current version by running SQL migration files
@@ -67,6 +71,22 @@ func upgrade(db *sqlx.DB, fs stuffbin.FileSystem, prompt bool) {
 			return
 		}
 	}
+
+	// Serialize the full read-pending -> migrate -> record sequence across
+	// containers. PostgreSQL releases this session lock if the process exits.
+	lockConn, err := db.Connx(context.Background())
+	if err != nil {
+		log.Fatalf("error opening migration lock connection: %v", err)
+	}
+	defer lockConn.Close()
+	if _, err := lockConn.ExecContext(context.Background(), `SELECT pg_advisory_lock($1)`, migrationAdvisoryLockID); err != nil {
+		log.Fatalf("error acquiring migration lock: %v", err)
+	}
+	defer func() {
+		if _, err := lockConn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationAdvisoryLockID); err != nil {
+			log.Printf("warning: error releasing migration lock: %v", err)
+		}
+	}()
 
 	_, toRun, err := getPendingMigrations(db)
 	if err != nil {
@@ -139,9 +159,11 @@ func getLastMigrationVersion(db *sqlx.DB) (string, error) {
 // recordMigrationVersion inserts the given version (of DB migration) into the
 // `migrations` array in the settings table.
 func recordMigrationVersion(ver string, db *sqlx.DB) error {
-	_, err := db.Exec(fmt.Sprintf(`INSERT INTO settings (key, value)
-	VALUES('migrations', '["%s"]'::JSONB)
-	ON CONFLICT (key) DO UPDATE SET value = settings.value || EXCLUDED.value`, ver))
+	_, err := db.Exec(`INSERT INTO settings (key, value)
+	VALUES('migrations', jsonb_build_array($1::text))
+	ON CONFLICT (key) DO UPDATE SET value =
+		CASE WHEN settings.value @> EXCLUDED.value THEN settings.value
+		ELSE settings.value || EXCLUDED.value END`, ver)
 	return err
 }
 

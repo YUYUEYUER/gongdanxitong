@@ -63,7 +63,7 @@
             <span v-if="message.content_type === 'text'" class="mb-1 whitespace-pre-wrap">{{
               message.content
             }}</span>
-            <Letter
+            <SecureLetter
               v-else
               :html="message.content"
               :allowedSchemas="['cid', 'https', 'http', 'mailto']"
@@ -155,7 +155,7 @@ import { useWidgetStore } from '../store/widget.js'
 import { useChatStore } from '../store/chat.js'
 import { useRelativeTime } from '@widget/composables/useRelativeTime.js'
 import { useI18n } from 'vue-i18n'
-import { Letter } from 'vue-letter'
+import SecureLetter from '@shared-ui/components/SecureLetter.vue'
 import { allowedCssProperties } from 'lettersanitizer'
 import ScrollToBottomButton from '@shared-ui/components/ScrollToBottomButton'
 import ChatIntro from './ChatIntro.vue'

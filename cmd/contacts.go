@@ -1,7 +1,6 @@
 package main
 
 import (
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -128,6 +127,9 @@ func handleUpdateContact(r *fastglue.Request) error {
 	if country == "null" {
 		country = ""
 	}
+	if !requestedContactAvatarAllowed(contact.AvatarURL, avatarURL) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.T("globals.messages.badRequest"), nil, envelope.InputError)
+	}
 
 	// Validate mandatory fields.
 	if email == "" {
@@ -138,6 +140,9 @@ func handleUpdateContact(r *fastglue.Request) error {
 	}
 	if firstName == "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, app.i18n.Ts("globals.messages.empty", "name", "first_name"), nil, envelope.InputError)
+	}
+	if contact.PortalRegistered && !strings.EqualFold(strings.TrimSpace(contact.Email.String), email) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Portal email changes require verification", nil, envelope.InputError)
 	}
 
 	contactToUpdate := models.User{
@@ -156,8 +161,9 @@ func handleUpdateContact(r *fastglue.Request) error {
 
 	// Delete avatar?
 	if avatarURL == "" && contact.AvatarURL.Valid {
-		fileName := filepath.Base(contact.AvatarURL.String)
-		app.media.Delete(fileName)
+		if err := deleteOwnedUserAvatarMedia(app, contact.ID, contact.AvatarURL.String); err != nil {
+			app.lo.Error("error deleting owned contact avatar", "user_id", contact.ID, "error", err)
+		}
 		contact.AvatarURL.Valid = false
 		contact.AvatarURL.String = ""
 	}

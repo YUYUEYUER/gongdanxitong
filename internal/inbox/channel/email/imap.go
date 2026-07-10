@@ -1,10 +1,14 @@
 package email
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -19,8 +23,32 @@ import (
 )
 
 const (
-	defaultReadInterval   = time.Duration(5 * time.Minute)
-	defaultScanInboxSince = time.Duration(48 * time.Hour)
+	defaultReadInterval       = time.Duration(5 * time.Minute)
+	defaultScanInboxSince     = time.Duration(48 * time.Hour)
+	maxRawEmailBytes          = int64(25 << 20)
+	maxEmailBodyBytes         = 2 << 20
+	maxEmailSubjectBytes      = 1_000
+	maxEmailAttachments       = 25
+	maxEmailAttachment        = 10 << 20
+	maxEmailAttachmentsTotal  = 20 << 20
+	maxIMAPMessagesPerPoll    = 100
+	maxIMAPHeadMessagesPoll   = 50
+	maxIMAPBytesPerPoll       = int64(100 << 20)
+	maxIMAPHeaderBytes        = int64(64 << 10)
+	maxIMAPInboxMessagesHour  = 500
+	maxIMAPInboxBytesHour     = int64(512 << 20)
+	maxIMAPInboxMessagesDay   = 5_000
+	maxIMAPInboxBytesDay      = int64(2 << 30)
+	maxIMAPSenderMessagesHour = 30
+	maxIMAPSenderBytesHour    = int64(50 << 20)
+	maxIMAPSenderMessagesDay  = 200
+	maxIMAPSenderBytesDay     = int64(250 << 20)
+	imapIngressSweepInterval  = time.Hour
+)
+
+var (
+	errIMAPPollByteBudget = errors.New("IMAP poll byte budget exhausted")
+	errIMAPIngressBudget  = errors.New("IMAP rolling ingress budget exhausted")
 )
 
 // ReadIncomingMessages reads and processes incoming messages from an IMAP server based on the provided configuration.
@@ -110,7 +138,8 @@ func (e *Email) processMailbox(ctx context.Context, scanInboxSince time.Duration
 		}
 	}
 
-	if _, err := client.Select(cfg.Mailbox, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+	selected, err := client.Select(cfg.Mailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
 		return fmt.Errorf("error selecting mailbox: %w", err)
 	}
 
@@ -119,63 +148,344 @@ func (e *Email) processMailbox(ctx context.Context, scanInboxSince time.Duration
 
 	e.lo.Info("searching emails", "since", since, "mailbox", cfg.Mailbox, "inbox_id", e.Identifier())
 
-	// Search for messages in the mailbox.
-	searchResults, err := e.searchMessages(client, since)
+	cursorKey := imapCursorKey(cfg)
+	cursor := e.getIMAPCursor(cursorKey)
+	window := boundedIMAPSearchWindow(selected.NumMessages, cursor, maxIMAPMessagesPerPoll, maxIMAPHeadMessagesPoll)
+	if window.count == 0 {
+		return nil
+	}
+
+	// Apply the bound to SEARCH itself, not just to the later FETCH.
+	searchResults, err := e.searchMessages(client, since, window.set)
 	if err != nil {
 		return fmt.Errorf("error searching messages: %w", err)
 	}
 
-	return e.fetchAndProcessMessages(ctx, client, searchResults, e.Identifier())
+	nextCursor, err := e.fetchAndProcessMessages(ctx, client, searchResults, e.Identifier(), cursor, window.nextCursor, cursorKey)
+	e.setIMAPCursor(cursorKey, nextCursor)
+	return err
 }
 
-// searchMessages searches for messages in the specified time range.
-// Uses ESEARCH if supported by the server, otherwise falls back to standard SEARCH.
-func (e *Email) searchMessages(client *imapclient.Client, since time.Time) (*imap.SearchData, error) {
-	criteria := &imap.SearchCriteria{
-		Since: since,
+// searchMessages uses a sequence-number constraint that is already bounded.
+// Standard SEARCH is intentionally used so servers without ESEARCH have the
+// same bounded response size.
+func (e *Email) searchMessages(client *imapclient.Client, since time.Time, seqSet imap.SeqSet) (*imap.SearchData, error) {
+	return client.Search(boundedIMAPSearchCriteria(since, seqSet), nil).Wait()
+}
+
+func boundedIMAPSearchCriteria(since time.Time, seqSet imap.SeqSet) *imap.SearchCriteria {
+	return &imap.SearchCriteria{
+		Since:  since,
+		SeqNum: []imap.SeqSet{seqSet},
+	}
+}
+
+type imapSearchWindow struct {
+	set        imap.SeqSet
+	count      int
+	nextCursor uint32
+}
+
+// boundedIMAPSearchWindow always includes the newest messages and uses the
+// remaining capacity to walk older mail backwards. This keeps new delivery
+// responsive while eventually revisiting failures and historical backlog.
+func boundedIMAPSearchWindow(numMessages, cursor uint32, limit, headLimit int) imapSearchWindow {
+	if numMessages == 0 || limit <= 0 {
+		return imapSearchWindow{}
+	}
+	if uint64(limit) > uint64(numMessages) {
+		limit = int(numMessages)
+	}
+	if headLimit <= 0 {
+		headLimit = 1
+	}
+	if headLimit > limit {
+		headLimit = limit
 	}
 
-	// Attempt ESEARCH if server supports it
-	if client.Caps().Has(imap.CapESearch) {
-		opts := &imap.SearchOptions{
-			ReturnMin:   true,
-			ReturnMax:   true,
-			ReturnAll:   true,
-			ReturnCount: true,
-		}
+	headStart := numMessages - uint32(headLimit) + 1
+	var set imap.SeqSet
+	set.AddRange(headStart, numMessages)
+	count := headLimit
+	nextCursor := uint32(0)
 
-		result, err := client.Search(criteria, opts).Wait()
-		if err == nil {
-			return result, nil
+	backlogCapacity := limit - headLimit
+	if backlogCapacity > 0 && headStart > 1 {
+		maxBacklogCursor := headStart - 1
+		if cursor == 0 || cursor > maxBacklogCursor {
+			cursor = maxBacklogCursor
 		}
-
-		e.lo.Warn("ESEARCH failed, falling back to standard SEARCH", "error", err, "inbox_id", e.Identifier())
+		backlogStart := uint32(1)
+		if cursor >= uint32(backlogCapacity) {
+			backlogStart = cursor - uint32(backlogCapacity) + 1
+		}
+		set.AddRange(backlogStart, cursor)
+		count += int(cursor - backlogStart + 1)
+		if backlogStart > 1 {
+			nextCursor = backlogStart - 1
+		} else {
+			nextCursor = maxBacklogCursor
+		}
 	}
 
-	return client.Search(criteria, nil).Wait()
+	return imapSearchWindow{set: set, count: count, nextCursor: nextCursor}
+}
+
+type imapSequencePage struct {
+	set        imap.SeqSet
+	nums       []uint32
+	nextCursor uint32
+}
+
+// boundedSearchSequencePage returns a bounded, ascending page without
+// expanding the complete SEARCH result into a slice.
+func boundedSearchSequencePage(searchResults *imap.SearchData, cursor uint32, limit int) imapSequencePage {
+	if searchResults == nil || limit <= 0 {
+		return imapSequencePage{}
+	}
+
+	var ranges imap.SeqSet
+	if all, ok := searchResults.All.(imap.SeqSet); ok && len(all) > 0 {
+		ranges = all
+	}
+	if len(ranges) == 0 || ranges.Dynamic() {
+		return imapSequencePage{}
+	}
+
+	collect := func(start uint32) []uint32 {
+		nums := make([]uint32, 0, limit)
+		for _, seqRange := range ranges {
+			if seqRange.Start == 0 || seqRange.Stop == 0 || (start > 0 && seqRange.Stop < start) {
+				continue
+			}
+			first := seqRange.Start
+			if start > first {
+				first = start
+			}
+			for seqNum := first; seqNum <= seqRange.Stop && len(nums) < limit; seqNum++ {
+				nums = append(nums, seqNum)
+				if seqNum == ^uint32(0) {
+					break
+				}
+			}
+			if len(nums) == limit {
+				break
+			}
+		}
+		return nums
+	}
+
+	nums := collect(cursor)
+	if len(nums) == 0 && cursor > 0 {
+		nums = collect(0)
+	}
+	if len(nums) == 0 {
+		return imapSequencePage{}
+	}
+
+	var set imap.SeqSet
+	set.AddNum(nums...)
+	nextCursor := nums[len(nums)-1] + 1
+	if nextCursor == 0 {
+		nextCursor = 1
+	}
+	return imapSequencePage{set: set, nums: nums, nextCursor: nextCursor}
+}
+
+type imapPollBudget struct {
+	remaining int64
+}
+
+type imapIngressEvent struct {
+	at   time.Time
+	size int64
+}
+
+type imapIngressLimits struct {
+	hourMessages int
+	hourBytes    int64
+	dayMessages  int
+	dayBytes     int64
+}
+
+func defaultIMAPInboxIngressLimits() imapIngressLimits {
+	return imapIngressLimits{
+		hourMessages: maxIMAPInboxMessagesHour,
+		hourBytes:    maxIMAPInboxBytesHour,
+		dayMessages:  maxIMAPInboxMessagesDay,
+		dayBytes:     maxIMAPInboxBytesDay,
+	}
+}
+
+func defaultIMAPSenderIngressLimits() imapIngressLimits {
+	return imapIngressLimits{
+		hourMessages: maxIMAPSenderMessagesHour,
+		hourBytes:    maxIMAPSenderBytesHour,
+		dayMessages:  maxIMAPSenderMessagesDay,
+		dayBytes:     maxIMAPSenderBytesDay,
+	}
+}
+
+func newIMAPPollBudget(limit int64) imapPollBudget {
+	if limit < 0 {
+		limit = 0
+	}
+	return imapPollBudget{remaining: limit}
+}
+
+func (b *imapPollBudget) reserve(messageSize int64) bool {
+	if !b.canReserve(messageSize) {
+		return false
+	}
+	b.remaining -= normalizedIMAPMessageSize(messageSize)
+	return true
+}
+
+func (b *imapPollBudget) canReserve(messageSize int64) bool {
+	return b != nil && normalizedIMAPMessageSize(messageSize) <= b.remaining
+}
+
+func normalizedIMAPMessageSize(messageSize int64) int64 {
+	if messageSize <= 0 {
+		return maxRawEmailBytes
+	}
+	return messageSize
+}
+
+func (e *Email) reserveIMAPIngress(mailboxKey, sender string, messageSize int64, now time.Time) error {
+	return e.reserveIMAPIngressWithLimits(
+		mailboxKey,
+		sender,
+		messageSize,
+		now,
+		defaultIMAPInboxIngressLimits(),
+		defaultIMAPSenderIngressLimits(),
+	)
+}
+
+func (e *Email) reserveIMAPIngressWithLimits(mailboxKey, sender string, messageSize int64, now time.Time, inboxLimits, senderLimits imapIngressLimits) error {
+	messageSize = normalizedIMAPMessageSize(messageSize)
+	mailboxUsageKey := "mailbox:" + mailboxKey
+	senderHash := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(sender))))
+	senderUsageKey := fmt.Sprintf("sender:%s:%x", mailboxKey, senderHash)
+
+	e.imapIngressMu.Lock()
+	defer e.imapIngressMu.Unlock()
+	if e.imapIngressEvents == nil {
+		e.imapIngressEvents = make(map[string][]imapIngressEvent)
+	}
+	e.sweepIMAPIngressEventsLocked(now)
+
+	if err := checkIMAPIngressUsage(e.imapIngressEvents[mailboxUsageKey], now, messageSize, inboxLimits, "mailbox"); err != nil {
+		return err
+	}
+	if err := checkIMAPIngressUsage(e.imapIngressEvents[senderUsageKey], now, messageSize, senderLimits, "sender"); err != nil {
+		return err
+	}
+
+	event := imapIngressEvent{at: now, size: messageSize}
+	e.imapIngressEvents[mailboxUsageKey] = append(e.imapIngressEvents[mailboxUsageKey], event)
+	e.imapIngressEvents[senderUsageKey] = append(e.imapIngressEvents[senderUsageKey], event)
+	return nil
+}
+
+func checkIMAPIngressUsage(events []imapIngressEvent, now time.Time, messageSize int64, limits imapIngressLimits, scope string) error {
+	hourCutoff := now.Add(-time.Hour)
+	dayCutoff := now.Add(-24 * time.Hour)
+	var hourMessages, dayMessages int
+	var hourBytes, dayBytes int64
+	for _, event := range events {
+		if event.at.After(dayCutoff) {
+			dayMessages++
+			dayBytes += event.size
+		}
+		if event.at.After(hourCutoff) {
+			hourMessages++
+			hourBytes += event.size
+		}
+	}
+
+	if limits.hourMessages <= 0 || hourMessages >= limits.hourMessages {
+		return fmt.Errorf("%w: %s hourly message count", errIMAPIngressBudget, scope)
+	}
+	if exceedsIMAPByteLimit(hourBytes, messageSize, limits.hourBytes) {
+		return fmt.Errorf("%w: %s hourly bytes", errIMAPIngressBudget, scope)
+	}
+	if limits.dayMessages <= 0 || dayMessages >= limits.dayMessages {
+		return fmt.Errorf("%w: %s daily message count", errIMAPIngressBudget, scope)
+	}
+	if exceedsIMAPByteLimit(dayBytes, messageSize, limits.dayBytes) {
+		return fmt.Errorf("%w: %s daily bytes", errIMAPIngressBudget, scope)
+	}
+	return nil
+}
+
+func exceedsIMAPByteLimit(used, additional, limit int64) bool {
+	return limit <= 0 || additional > limit || used > limit-additional
+}
+
+func (e *Email) sweepIMAPIngressEventsLocked(now time.Time) {
+	if !e.imapIngressLastSweep.IsZero() && !now.Before(e.imapIngressLastSweep) && now.Sub(e.imapIngressLastSweep) < imapIngressSweepInterval {
+		return
+	}
+	cutoff := now.Add(-24 * time.Hour)
+	for key, events := range e.imapIngressEvents {
+		kept := events[:0]
+		for _, event := range events {
+			if event.at.After(cutoff) {
+				kept = append(kept, event)
+			}
+		}
+		clear(events[len(kept):])
+		if len(kept) == 0 {
+			delete(e.imapIngressEvents, key)
+			continue
+		}
+		e.imapIngressEvents[key] = kept
+	}
+	e.imapIngressLastSweep = now
+}
+
+func imapCursorKey(cfg imodels.IMAPConfig) string {
+	return fmt.Sprintf("%s:%d/%s/%s", strings.ToLower(strings.TrimSpace(cfg.Host)), cfg.Port, strings.ToLower(strings.TrimSpace(cfg.Username)), strings.TrimSpace(cfg.Mailbox))
+}
+
+func (e *Email) getIMAPCursor(key string) uint32 {
+	e.imapCursorMu.Lock()
+	defer e.imapCursorMu.Unlock()
+	return e.imapCursors[key]
+}
+
+func (e *Email) setIMAPCursor(key string, cursor uint32) {
+	e.imapCursorMu.Lock()
+	defer e.imapCursorMu.Unlock()
+	if e.imapCursors == nil {
+		e.imapCursors = make(map[string]uint32)
+	}
+	e.imapCursors[key] = cursor
 }
 
 // fetchAndProcessMessages fetches and processes messages based on the search results.
-func (e *Email) fetchAndProcessMessages(ctx context.Context, client *imapclient.Client, searchResults *imap.SearchData, inboxID int) error {
-	seqSet := imap.SeqSet{}
-	if searchResults.Min > 0 && searchResults.Max > 0 {
-		e.lo.Debug("using ESEARCH range", "min", searchResults.Min, "max", searchResults.Max, "inbox_id", inboxID)
-		seqSet.AddRange(searchResults.Min, searchResults.Max)
-	} else if seqNums := searchResults.AllSeqNums(); len(seqNums) > 0 {
-		e.lo.Debug("using SEARCH fallback (no ESEARCH support)", "count", len(seqNums), "inbox_id", inboxID)
-		seqSet.AddNum(seqNums...)
-	} else {
+func (e *Email) fetchAndProcessMessages(ctx context.Context, client *imapclient.Client, searchResults *imap.SearchData, inboxID int, retryCursor, nextCursor uint32, mailboxKey string) (uint32, error) {
+	page := boundedSearchSequencePage(searchResults, 0, maxIMAPMessagesPerPoll)
+	if len(page.nums) == 0 {
 		// No results found
 		e.lo.Debug("no messages found in search results", "inbox_id", inboxID)
-		return nil
+		return nextCursor, nil
 	}
+	e.lo.Debug("processing bounded IMAP page", "count", len(page.nums), "first", page.nums[0], "last", page.nums[len(page.nums)-1], "inbox_id", inboxID)
 
 	// Fetch envelope and headers needed for auto-reply detection.
 	fetchOptions := &imap.FetchOptions{
-		Envelope: true,
+		Envelope:   true,
+		RFC822Size: true,
 		BodySection: []*imap.FetchItemBodySection{
 			{
 				Specifier: imap.PartSpecifierHeader,
+				Partial: &imap.SectionPartial{
+					Offset: 0,
+					Size:   maxIMAPHeaderBytes,
+				},
 				HeaderFields: []string{
 					headerAutoSubmitted,
 					headerAutoreply,
@@ -193,26 +503,33 @@ func (e *Email) fetchAndProcessMessages(ctx context.Context, client *imapclient.
 		autoReply          bool
 		isLoop             bool
 		extractedMessageID string
+		size               int64
 	}
 	var messages []msgData
 
-	fetchCmd := client.Fetch(seqSet, fetchOptions)
+	fetchCmd := client.Fetch(page.set, fetchOptions)
+	fetchClosed := false
+	defer func() {
+		if !fetchClosed {
+			_ = fetchCmd.Close()
+		}
+	}()
 
 	// Extract the inbox email address.
 	inboxEmail, err := stringutil.ExtractEmail(e.FromAddress())
 	if err != nil {
 		e.lo.Error("failed to extract email address from the 'From' header", "error", err)
-		return fmt.Errorf("failed to extract email address from 'From' header: %w", err)
+		return retryCursor, fmt.Errorf("failed to extract email address from 'From' header: %w", err)
 	}
 	if inboxEmail == "" {
 		e.lo.Error("inbox email address is empty, cannot process messages", "inbox_id", e.Identifier())
-		return fmt.Errorf("inbox (%d) email address is empty, cannot process messages", e.Identifier())
+		return retryCursor, fmt.Errorf("inbox (%d) email address is empty, cannot process messages", e.Identifier())
 	}
 	for {
 		// Check for context cancellation before fetching the next message.
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return retryCursor, ctx.Err()
 		default:
 		}
 
@@ -228,13 +545,14 @@ func (e *Email) fetchAndProcessMessages(ctx context.Context, client *imapclient.
 			autoReply          bool
 			isLoop             bool
 			extractedMessageID string
+			size               int64
 		)
 		// Process all fetch items for the current message.
 		for {
 			// Check for context cancellation before processing the next item.
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return retryCursor, ctx.Err()
 			default:
 			}
 
@@ -247,25 +565,37 @@ func (e *Email) fetchAndProcessMessages(ctx context.Context, client *imapclient.
 
 			// Body section.
 			if bs, ok := item.(imapclient.FetchItemDataBodySection); ok && bs.Literal != nil {
-				envelope, err := enmime.ReadEnvelope(bs.Literal)
+				var parsedEnvelope *enmime.Envelope
+				err := guardEmailProcessing(msg.SeqNum, func() error {
+					var parseErr error
+					parsedEnvelope, parseErr = enmime.ReadEnvelope(bs.Literal)
+					return parseErr
+				})
 				if err != nil {
 					e.lo.Error("error reading envelope", "error", err)
 					continue
 				}
-				if isAutoReply(envelope) {
+				if parsedEnvelope == nil {
+					e.lo.Warn("skipping message with empty parsed envelope", "seq_num", msg.SeqNum, "inbox_id", e.Identifier())
+					continue
+				}
+				if isAutoReply(parsedEnvelope) {
 					autoReply = true
 				}
-				if isLoopMessage(envelope, inboxEmail) {
+				if isLoopMessage(parsedEnvelope, inboxEmail) {
 					isLoop = true
 				}
 
 				// Extract Message-Id from raw headers as fallback for problematic Message IDs
-				extractedMessageID = extractMessageIDFromHeaders(envelope)
+				extractedMessageID = extractMessageIDFromHeaders(parsedEnvelope)
 			}
 
 			// Envelope.
 			if ed, ok := item.(imapclient.FetchItemDataEnvelope); ok {
 				env = ed.Envelope
+			}
+			if sd, ok := item.(imapclient.FetchItemDataRFC822Size); ok {
+				size = sd.Size
 			}
 		}
 
@@ -274,16 +604,27 @@ func (e *Email) fetchAndProcessMessages(ctx context.Context, client *imapclient.
 			e.lo.Warn("skipping message without envelope", "seq_num", msg.SeqNum, "inbox_id", e.Identifier())
 			continue
 		}
+		if size > maxRawEmailBytes {
+			e.lo.Warn("skipping oversized email", "seq_num", msg.SeqNum, "inbox_id", e.Identifier(), "size", size, "max_size", maxRawEmailBytes)
+			continue
+		}
 
-		messages = append(messages, msgData{env: env, seqNum: msg.SeqNum, autoReply: autoReply, isLoop: isLoop, extractedMessageID: extractedMessageID})
+		messages = append(messages, msgData{env: env, seqNum: msg.SeqNum, autoReply: autoReply, isLoop: isLoop, extractedMessageID: extractedMessageID, size: size})
 	}
+	if err := fetchCmd.Close(); err != nil {
+		fetchClosed = true
+		return retryCursor, fmt.Errorf("fetching IMAP message headers: %w", err)
+	}
+	fetchClosed = true
 
-	// Now process each collected message.
+	budget := newIMAPPollBudget(maxIMAPBytesPerPoll)
+
+	// Now process the bounded collection of messages.
 	for _, msgData := range messages {
 		// Check for context cancellation before processing each message.
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return msgData.seqNum, ctx.Err()
 		default:
 		}
 
@@ -300,16 +641,29 @@ func (e *Email) fetchAndProcessMessages(ctx context.Context, client *imapclient.
 		}
 
 		// Process the envelope.
-		if err := e.processEnvelope(ctx, client, msgData.env, msgData.seqNum, inboxID, msgData.extractedMessageID); err != nil && err != context.Canceled {
+		err := guardEmailProcessing(msgData.seqNum, func() error {
+			return e.processEnvelope(ctx, client, msgData.env, msgData.seqNum, inboxID, msgData.extractedMessageID, msgData.size, mailboxKey, &budget)
+		})
+		if errors.Is(err, errIMAPPollByteBudget) {
+			e.lo.Info("IMAP poll byte budget exhausted", "inbox_id", inboxID, "next_seq_num", msgData.seqNum, "byte_budget", maxIMAPBytesPerPoll)
+			return msgData.seqNum, nil
+		}
+		if errors.Is(err, errIMAPIngressBudget) {
+			e.lo.Warn("IMAP rolling ingress budget exhausted", "inbox_id", inboxID, "seq_num", msgData.seqNum, "error", err)
+			continue
+		}
+		if err != nil && err != context.Canceled {
 			e.lo.Error("error processing envelope", "error", err)
 		}
+		// Advance past per-message failures. They are retried when the bounded
+		// cursor wraps, so one malformed message cannot permanently stall mail.
 	}
 
-	return nil
+	return nextCursor, nil
 }
 
 // processEnvelope processes a single email envelope.
-func (e *Email) processEnvelope(ctx context.Context, client *imapclient.Client, env *imap.Envelope, seqNum uint32, inboxID int, extractedMessageID string) error {
+func (e *Email) processEnvelope(ctx context.Context, client *imapclient.Client, env *imap.Envelope, seqNum uint32, inboxID int, extractedMessageID string, messageSize int64, mailboxKey string, budget *imapPollBudget) error {
 	if len(env.From) == 0 {
 		e.lo.Warn("no sender received for email", "message_id", env.MessageID)
 		return nil
@@ -348,6 +702,15 @@ func (e *Email) processEnvelope(ctx context.Context, client *imapclient.Client, 
 	} else if blocked {
 		e.lo.Info("contact email is blocked dropping incoming email", "email", fromAddress)
 		return nil
+	}
+	if budget == nil || !budget.canReserve(messageSize) {
+		return errIMAPPollByteBudget
+	}
+	if err := e.reserveIMAPIngress(mailboxKey, fromAddress, messageSize, time.Now()); err != nil {
+		return err
+	}
+	if !budget.reserve(messageSize) {
+		return errIMAPPollByteBudget
 	}
 
 	e.lo.Debug("processing new incoming message", "message_id", messageID, "subject", env.Subject, "from", fromAddress, "inbox_id", inboxID)
@@ -414,8 +777,19 @@ func (e *Email) processEnvelope(ctx context.Context, client *imapclient.Client, 
 	seqSet.AddNum(seqNum)
 
 	fullFetchCmd := client.Fetch(seqSet, fetchOptions)
+	fullFetchClosed := false
+	defer func() {
+		if !fullFetchClosed {
+			_ = fullFetchCmd.Close()
+		}
+	}()
 	fullMsg := fullFetchCmd.Next()
 	if fullMsg == nil {
+		err := fullFetchCmd.Close()
+		fullFetchClosed = true
+		if err != nil {
+			return fmt.Errorf("fetching full IMAP message: %w", err)
+		}
 		return nil
 	}
 
@@ -442,13 +816,21 @@ func (e *Email) processEnvelope(ctx context.Context, client *imapclient.Client, 
 
 // processFullMessage processes the full message and enqueues it for inserting into the database.
 func (e *Email) processFullMessage(item imapclient.FetchItemDataBodySection, incomingMsg models.IncomingMessage) error {
-	envelope, err := enmime.ReadEnvelope(item.Literal)
+	envelope, err := readEnvelopeWithLimit(item.Literal, maxRawEmailBytes)
 	if err != nil {
 		e.lo.Error("error parsing email envelope", "error", err, "message_id", incomingMsg.SourceID.String)
-		for _, err := range envelope.Errors {
-			e.lo.Error("error parsing email envelope. envelope_error: ", "error", err.Error(), "message_id", incomingMsg.SourceID.String)
+		if envelope != nil {
+			for _, envelopeErr := range envelope.Errors {
+				e.lo.Error("error parsing email envelope", "error", envelopeErr.Error(), "message_id", incomingMsg.SourceID.String)
+			}
 		}
 		return fmt.Errorf("parsing email envelope: %w", err)
+	}
+	if err := validateEnvelopeResources(envelope); err != nil {
+		return err
+	}
+	if len(incomingMsg.Subject) > maxEmailSubjectBytes {
+		return fmt.Errorf("email subject exceeds %d bytes", maxEmailSubjectBytes)
 	}
 
 	// Log any envelope errors.
@@ -473,7 +855,6 @@ func (e *Email) processFullMessage(item imapclient.FetchItemDataBodySection, inc
 	if allHTML.Len() > 0 {
 		incomingMsg.Content = allHTML.String()
 		incomingMsg.ContentType = models.ContentTypeHTML
-		e.lo.Debug("extracted HTML content from parts", "message_id", incomingMsg.SourceID.String, "content", incomingMsg.Content)
 	} else if len(envelope.HTML) > 0 {
 		incomingMsg.Content = envelope.HTML
 		incomingMsg.ContentType = models.ContentTypeHTML
@@ -481,9 +862,9 @@ func (e *Email) processFullMessage(item imapclient.FetchItemDataBodySection, inc
 		incomingMsg.Content = envelope.Text
 		incomingMsg.ContentType = models.ContentTypeText
 	}
-
-	e.lo.Debug("envelope HTML content", "message_id", incomingMsg.SourceID.String, "content", incomingMsg.Content)
-	e.lo.Debug("envelope text content", "message_id", incomingMsg.SourceID.String, "content", envelope.Text)
+	if len(incomingMsg.Content) > maxEmailBodyBytes {
+		return fmt.Errorf("email body exceeds %d bytes", maxEmailBodyBytes)
+	}
 
 	// Clean headers
 	inReplyTo := strings.ReplaceAll(strings.ReplaceAll(envelope.GetHeader("In-Reply-To"), "<", ""), ">", "")
@@ -544,6 +925,64 @@ func (e *Email) processFullMessage(item imapclient.FetchItemDataBodySection, inc
 		return err
 	}
 	return nil
+}
+
+func readEnvelopeWithLimit(r io.Reader, limit int64) (*enmime.Envelope, error) {
+	if r == nil {
+		return nil, fmt.Errorf("email body is missing")
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("email size limit must be positive")
+	}
+	raw, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading email body: %w", err)
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("email exceeds %d bytes", limit)
+	}
+	return enmime.ReadEnvelope(bytes.NewReader(raw))
+}
+
+func validateEnvelopeResources(envelope *enmime.Envelope) error {
+	if envelope == nil {
+		return fmt.Errorf("email envelope is missing")
+	}
+	count := len(envelope.Attachments) + len(envelope.Inlines)
+	if count > maxEmailAttachments {
+		return fmt.Errorf("email has too many attachments: %d", count)
+	}
+	total := 0
+	check := func(size int) error {
+		if size > maxEmailAttachment {
+			return fmt.Errorf("email attachment exceeds %d bytes", maxEmailAttachment)
+		}
+		if total > maxEmailAttachmentsTotal-size {
+			return fmt.Errorf("email attachments exceed %d bytes", maxEmailAttachmentsTotal)
+		}
+		total += size
+		return nil
+	}
+	for _, att := range envelope.Attachments {
+		if err := check(len(att.Content)); err != nil {
+			return err
+		}
+	}
+	for _, inline := range envelope.Inlines {
+		if err := check(len(inline.Content)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func guardEmailProcessing(seqNum uint32, process func() error) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = fmt.Errorf("panic while processing email sequence %d", seqNum)
+		}
+	}()
+	return process()
 }
 
 // getContactName extracts the contact's first and last name from the IMAP address.

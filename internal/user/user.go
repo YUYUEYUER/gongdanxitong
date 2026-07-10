@@ -3,8 +3,10 @@ package user
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,8 @@ import (
 
 	"github.com/abhinavxd/libredesk/internal/dbutil"
 	"github.com/abhinavxd/libredesk/internal/envelope"
+	"github.com/abhinavxd/libredesk/internal/jsonutil"
+	mediamanager "github.com/abhinavxd/libredesk/internal/media"
 	rmodels "github.com/abhinavxd/libredesk/internal/role/models"
 	"github.com/abhinavxd/libredesk/internal/stringutil"
 	"github.com/abhinavxd/libredesk/internal/user/models"
@@ -31,7 +35,8 @@ import (
 
 var (
 	//go:embed queries.sql
-	efs embed.FS
+	efs               embed.FS
+	dummyPasswordHash = mustDummyPasswordHash()
 
 	minPassword     = 10
 	maxPassword     = 72
@@ -42,6 +47,12 @@ var (
 	ErrPasswordTooLong = errors.New("password length exceeds 72 bytes")
 
 	PasswordHint = fmt.Sprintf("Password must be %d-%d characters long should contain at least one uppercase letter, one lowercase letter, one number, and one special character.", minPassword, maxPassword)
+)
+
+const (
+	maxUserCustomAttributeCount      = 100
+	maxUserCustomAttributeKeyBytes   = 128
+	maxUserCustomAttributesJSONBytes = 64 * 1024
 )
 
 const (
@@ -57,6 +68,10 @@ type Manager struct {
 	db           *sqlx.DB
 	agentCache   map[int]cachedAgent
 	agentCacheMu sync.RWMutex
+	// Cache versions prevent an in-flight DB read from repopulating stale
+	// permissions after an invalidation has completed.
+	agentCacheEpoch      uint64
+	agentCacheGeneration map[int]uint64
 
 	lastActiveFlushAt   map[int]time.Time
 	lastActiveFlushAtMu sync.Mutex
@@ -75,40 +90,50 @@ type Opts struct {
 
 // queries contains prepared SQL queries.
 type queries struct {
-	GetUser                       *sqlx.Stmt `query:"get-user"`
-	GetNotes                      *sqlx.Stmt `query:"get-notes"`
-	GetNote                       *sqlx.Stmt `query:"get-note"`
-	GetUserIDsByRole              *sqlx.Stmt `query:"get-user-ids-by-role"`
-	GetUserByExternalID           *sqlx.Stmt `query:"get-user-by-external-id"`
-	GetUsersCompact               string     `query:"get-users-compact"`
-	UpdateContact                 *sqlx.Stmt `query:"update-contact"`
-	UpdateContactBasicInfo        *sqlx.Stmt `query:"update-contact-basic-info"`
-	UpdateAgent                   *sqlx.Stmt `query:"update-agent"`
-	UpdateCustomAttributes        *sqlx.Stmt `query:"update-custom-attributes"`
-	UpsertCustomAttributes        *sqlx.Stmt `query:"upsert-custom-attributes"`
-	UpdateAvatar                  *sqlx.Stmt `query:"update-avatar"`
-	UpdateAvailability            *sqlx.Stmt `query:"update-availability"`
-	UpdateLastActiveAt            *sqlx.Stmt `query:"update-last-active-at"`
-	UpdateInactiveOffline         *sqlx.Stmt `query:"update-inactive-offline"`
-	GetAvailabilityStatus         *sqlx.Stmt `query:"get-availability-status"`
-	UpdateLastLoginAt             *sqlx.Stmt `query:"update-last-login-at"`
-	SoftDeleteAgent               *sqlx.Stmt `query:"soft-delete-agent"`
-	SetUserPassword               *sqlx.Stmt `query:"set-user-password"`
-	SetResetPasswordToken         *sqlx.Stmt `query:"set-reset-password-token"`
-	SetPassword                   *sqlx.Stmt `query:"set-password"`
-	DeleteNote                    *sqlx.Stmt `query:"delete-note"`
-	InsertAgent                   *sqlx.Stmt `query:"insert-agent"`
-	InsertContactWithExtID        *sqlx.Stmt `query:"insert-contact-with-external-id"`
-	InsertContactNoExtID          *sqlx.Stmt `query:"insert-contact-without-external-id"`
-	GetContactByEmail             *sqlx.Stmt `query:"get-contact-by-email"`
-	GetContactByEmailWithoutExtID *sqlx.Stmt `query:"get-contact-by-email-without-ext-id"`
-	IsEmailBlocked                *sqlx.Stmt `query:"is-email-blocked"`
-	SetExternalUserID             *sqlx.Stmt `query:"set-external-user-id"`
-	InsertNote                    *sqlx.Stmt `query:"insert-note"`
-	InsertVisitor                 *sqlx.Stmt `query:"insert-visitor"`
-	GetVisitorByEmail             *sqlx.Stmt `query:"get-visitor-by-email"`
-	UpgradeVisitorToContact       *sqlx.Stmt `query:"upgrade-visitor-to-contact"`
-	ToggleEnable                  *sqlx.Stmt `query:"toggle-enable"`
+	GetUser                            *sqlx.Stmt `query:"get-user"`
+	GetNotes                           *sqlx.Stmt `query:"get-notes"`
+	GetNote                            *sqlx.Stmt `query:"get-note"`
+	GetUserIDsByRole                   *sqlx.Stmt `query:"get-user-ids-by-role"`
+	GetUserByExternalID                *sqlx.Stmt `query:"get-user-by-external-id"`
+	GetUsersCompact                    string     `query:"get-users-compact"`
+	UpdateContact                      *sqlx.Stmt `query:"update-contact"`
+	UpdateContactBasicInfo             *sqlx.Stmt `query:"update-contact-basic-info"`
+	UpdateAgent                        *sqlx.Stmt `query:"update-agent"`
+	UpdateCustomAttributes             *sqlx.Stmt `query:"update-custom-attributes"`
+	UpsertCustomAttributes             *sqlx.Stmt `query:"upsert-custom-attributes"`
+	UpdateAvatar                       *sqlx.Stmt `query:"update-avatar"`
+	UpdateAvailability                 *sqlx.Stmt `query:"update-availability"`
+	UpdateLastActiveAt                 *sqlx.Stmt `query:"update-last-active-at"`
+	UpdateInactiveOffline              *sqlx.Stmt `query:"update-inactive-offline"`
+	GetAvailabilityStatus              *sqlx.Stmt `query:"get-availability-status"`
+	UpdateLastLoginAt                  *sqlx.Stmt `query:"update-last-login-at"`
+	SoftDeleteAgent                    *sqlx.Stmt `query:"soft-delete-agent"`
+	SetUserPassword                    *sqlx.Stmt `query:"set-user-password"`
+	SetResetPasswordToken              *sqlx.Stmt `query:"set-reset-password-token"`
+	GetResetPasswordUserID             *sqlx.Stmt `query:"get-reset-password-user-id"`
+	SetPassword                        *sqlx.Stmt `query:"set-password"`
+	DeleteExpiredCustomerRegistrations *sqlx.Stmt `query:"delete-expired-customer-registrations"`
+	IsCustomerPortalRegisteredByEmail  *sqlx.Stmt `query:"is-customer-portal-registered-by-email"`
+	UpsertCustomerPortalRegistration   *sqlx.Stmt `query:"upsert-customer-portal-registration"`
+	GetCustomerRegistrationForUpdate   *sqlx.Stmt `query:"get-customer-registration-for-update"`
+	GetPortalUserForUpdate             *sqlx.Stmt `query:"get-portal-user-for-update"`
+	ActivateExistingPortalUser         *sqlx.Stmt `query:"activate-existing-portal-user"`
+	InsertPortalUser                   *sqlx.Stmt `query:"insert-portal-user"`
+	DeleteCustomerRegistration         *sqlx.Stmt `query:"delete-customer-registration"`
+	DeleteNote                         *sqlx.Stmt `query:"delete-note"`
+	InsertAgent                        *sqlx.Stmt `query:"insert-agent"`
+	InsertContactWithExtID             *sqlx.Stmt `query:"insert-contact-with-external-id"`
+	InsertContactNoExtID               *sqlx.Stmt `query:"insert-contact-without-external-id"`
+	GetContactByEmail                  *sqlx.Stmt `query:"get-contact-by-email"`
+	GetRegisteredPortalContactByEmail  *sqlx.Stmt `query:"get-registered-portal-contact-by-email"`
+	GetContactByEmailWithoutExtID      *sqlx.Stmt `query:"get-contact-by-email-without-ext-id"`
+	IsEmailBlocked                     *sqlx.Stmt `query:"is-email-blocked"`
+	SetExternalUserID                  *sqlx.Stmt `query:"set-external-user-id"`
+	InsertNote                         *sqlx.Stmt `query:"insert-note"`
+	InsertVisitor                      *sqlx.Stmt `query:"insert-visitor"`
+	GetVisitorByEmail                  *sqlx.Stmt `query:"get-visitor-by-email"`
+	UpgradeVisitorToContact            *sqlx.Stmt `query:"upgrade-visitor-to-contact"`
+	ToggleEnable                       *sqlx.Stmt `query:"toggle-enable"`
 
 	// API key queries
 	GetUserByAPIKey      *sqlx.Stmt `query:"get-user-by-api-key"`
@@ -116,7 +141,15 @@ type queries struct {
 	RevokeAPIKey         *sqlx.Stmt `query:"revoke-api-key"`
 	UpdateAPIKeyLastUsed *sqlx.Stmt `query:"update-api-key-last-used"`
 
-	MergeVisitorToContact *sqlx.Stmt `query:"merge-visitor-to-contact"`
+	TransferVisitorConversations       *sqlx.Stmt `query:"transfer-visitor-conversations"`
+	TransferVisitorMessages            *sqlx.Stmt `query:"transfer-visitor-messages"`
+	DeleteDuplicateVisitorParticipants *sqlx.Stmt `query:"delete-duplicate-visitor-participants"`
+	TransferVisitorParticipants        *sqlx.Stmt `query:"transfer-visitor-participants"`
+	TransferVisitorNotes               *sqlx.Stmt `query:"transfer-visitor-notes"`
+	TransferVisitorMedia               *sqlx.Stmt `query:"transfer-visitor-media"`
+	DeleteMergedVisitor                *sqlx.Stmt `query:"delete-merged-visitor"`
+	LockUsersForMerge                  *sqlx.Stmt `query:"lock-users-for-merge"`
+	GetMergeMediaUsage                 *sqlx.Stmt `query:"get-merge-media-usage"`
 }
 
 // New creates and returns a new instance of the Manager.
@@ -126,12 +159,13 @@ func New(i18n *i18n.I18n, opts Opts) (*Manager, error) {
 		return nil, fmt.Errorf("error scanning SQL file: %w", err)
 	}
 	return &Manager{
-		q:                 q,
-		lo:                opts.Lo,
-		i18n:              i18n,
-		db:                opts.DB,
-		agentCache:        make(map[int]cachedAgent),
-		lastActiveFlushAt: make(map[int]time.Time),
+		q:                    q,
+		lo:                   opts.Lo,
+		i18n:                 i18n,
+		db:                   opts.DB,
+		agentCache:           make(map[int]cachedAgent),
+		agentCacheGeneration: make(map[int]uint64),
+		lastActiveFlushAt:    make(map[int]time.Time),
 	}, nil
 }
 
@@ -140,6 +174,7 @@ func (u *Manager) VerifyPassword(email string, password []byte) (models.User, er
 	var user models.User
 	if err := u.q.GetUser.Get(&user, 0, email, pq.Array([]string{models.UserTypeAgent})); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, password)
 			return user, envelope.NewError(envelope.InputError, u.i18n.T("user.invalidEmailPassword"), nil)
 		}
 		u.lo.Error("error fetching user from db", "error", err)
@@ -231,6 +266,20 @@ func (u *Manager) GetContactByEmail(email string) (models.User, error) {
 	return user, nil
 }
 
+// GetRegisteredPortalContactByEmail returns the single canonical portal
+// identity for an email, even when external integrations created duplicates.
+func (u *Manager) GetRegisteredPortalContactByEmail(email string) (models.User, error) {
+	var portalUser models.User
+	if err := u.q.GetRegisteredPortalContactByEmail.Get(&portalUser, strings.TrimSpace(strings.ToLower(email))); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return portalUser, envelope.NewError(envelope.NotFoundError, u.i18n.T("validation.notFoundUser"), nil)
+		}
+		u.lo.Error("error fetching registered portal contact by email", "error", err)
+		return portalUser, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	return portalUser, nil
+}
+
 // GetContactByEmailWithoutExtID retrieves a contact by email that has no external_user_id set.
 func (u *Manager) GetContactByEmailWithoutExtID(email string) (models.User, error) {
 	var user models.User
@@ -305,22 +354,37 @@ func (u *Manager) UpdateLastLoginAt(id int) error {
 
 // SetResetPasswordToken sets a reset password token for an user and returns the token.
 func (u *Manager) SetResetPasswordToken(id int) (string, error) {
-	token, err := stringutil.RandomAlphanumeric(32)
+	token, err := stringutil.RandomAlphanumeric(48)
 	if err != nil {
 		u.lo.Error("error generating reset password token", "error", err)
 		return "", envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
-	if _, err := u.q.SetResetPasswordToken.Exec(id, token); err != nil {
+	if _, err := u.q.SetResetPasswordToken.Exec(id, securityTokenHash(token)); err != nil {
 		u.lo.Error("error setting reset password token", "error", err)
 		return "", envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	return token, nil
 }
 
-// ResetPassword sets a password for a given user's reset password token and returns the user ID.
-func (u *Manager) ResetPassword(token, password string) (int, error) {
+// ResetPassword sets a password for a reset token belonging to the expected user type.
+func (u *Manager) ResetPassword(token, password, userType string) (int, error) {
+	if userType != models.UserTypeAgent && userType != models.UserTypeContact {
+		return 0, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
+	}
 	if !IsStrongPassword(password) {
 		return 0, envelope.NewError(envelope.InputError, "Password is not strong enough, "+PasswordHint, nil)
+	}
+	tokenHash := securityTokenHash(strings.TrimSpace(token))
+	if tokenHash == "" {
+		return 0, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
+	}
+	var tokenUserID int
+	if err := u.q.GetResetPasswordUserID.Get(&tokenUserID, tokenHash, userType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
+		}
+		u.lo.Error("error validating reset password token", "error", err)
+		return 0, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -328,7 +392,7 @@ func (u *Manager) ResetPassword(token, password string) (int, error) {
 		return 0, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	var id int
-	if err := u.q.SetPassword.Get(&id, passwordHash, token); err != nil {
+	if err := u.q.SetPassword.Get(&id, passwordHash, tokenHash, userType); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, envelope.NewError(envelope.InputError, u.i18n.T("user.resetPasswordTokenExpired"), nil)
 		}
@@ -336,6 +400,14 @@ func (u *Manager) ResetPassword(token, password string) (int, error) {
 		return 0, envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	return id, nil
+}
+
+func securityTokenHash(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // UpdateAvailability updates the availability status of an user.
@@ -380,10 +452,10 @@ func (u *Manager) IsOffline(id int) bool {
 // SaveCustomAttributes sets or merges custom attributes for a user.
 // If replace is true, existing attributes are overwritten. Otherwise, attributes are merged.
 func (u *Manager) SaveCustomAttributes(id int, customAttributes map[string]any, replace bool) error {
-	jsonb, err := json.Marshal(customAttributes)
+	jsonb, err := encodeUserCustomAttributes(customAttributes)
 	if err != nil {
-		u.lo.Error("error marshalling custom attributes", "error", err)
-		return envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+		u.lo.Warn("rejecting invalid custom attributes", "error", err)
+		return envelope.NewError(envelope.InputError, u.i18n.T("globals.messages.badRequest"), nil)
 	}
 	var execErr error
 	if replace {
@@ -396,6 +468,35 @@ func (u *Manager) SaveCustomAttributes(id int, customAttributes map[string]any, 
 		return envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	return nil
+}
+
+// encodeUserCustomAttributes is the final boundary for every agent and Widget
+// custom-attribute write. Authentication state is never a custom attribute.
+func encodeUserCustomAttributes(customAttributes map[string]any) ([]byte, error) {
+	if err := jsonutil.ValidateSafeObjectKeys(customAttributes, jsonutil.DefaultMaxObjectDepth); err != nil {
+		return nil, err
+	}
+	sanitized := make(map[string]any, len(customAttributes))
+	for key, value := range customAttributes {
+		if key == customerPortalRegisteredKey {
+			continue
+		}
+		if key == "" || len(key) > maxUserCustomAttributeKeyBytes {
+			return nil, fmt.Errorf("invalid custom attribute key")
+		}
+		sanitized[key] = value
+	}
+	if len(sanitized) > maxUserCustomAttributeCount {
+		return nil, fmt.Errorf("too many custom attributes")
+	}
+	jsonb, err := json.Marshal(sanitized)
+	if err != nil {
+		return nil, err
+	}
+	if len(jsonb) > maxUserCustomAttributesJSONBytes {
+		return nil, fmt.Errorf("custom attributes exceed size limit")
+	}
+	return jsonb, nil
 }
 
 // ToggleEnabled toggles the enabled status of an user.
@@ -475,9 +576,67 @@ func (u *Manager) RevokeAPIKey(userID int) error {
 
 // MergeVisitorToContact transfers conversations from visitor to contact and deletes the visitor.
 func (u *Manager) MergeVisitorToContact(visitorID, contactID int) error {
-	if _, err := u.q.MergeVisitorToContact.Exec(visitorID, contactID); err != nil {
-		u.lo.Error("error merging visitor to contact", "visitor_id", visitorID, "contact_id", contactID, "error", err)
-		return fmt.Errorf("merging visitor to contact: %w", err)
+	if visitorID <= 0 || contactID <= 0 || visitorID == contactID {
+		return envelope.NewError(envelope.InputError, u.i18n.T("globals.messages.badRequest"), nil)
+	}
+	tx, err := u.db.Beginx()
+	if err != nil {
+		return envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	defer tx.Rollback()
+
+	type mergeUser struct {
+		ID   int    `db:"id"`
+		Type string `db:"type"`
+	}
+	var locked []mergeUser
+	if err := tx.Stmtx(u.q.LockUsersForMerge).Select(&locked, pq.Array([]int{visitorID, contactID})); err != nil || len(locked) != 2 {
+		u.lo.Warn("invalid users in visitor merge", "visitor_id", visitorID, "contact_id", contactID, "error", err)
+		return envelope.NewError(envelope.PermissionError, u.i18n.T("status.deniedPermission"), nil)
+	}
+	validVisitor, validContact := false, false
+	for _, item := range locked {
+		validVisitor = validVisitor || (item.ID == visitorID && item.Type == models.UserTypeVisitor)
+		validContact = validContact || (item.ID == contactID && item.Type == models.UserTypeContact)
+	}
+	if !validVisitor || !validContact {
+		return envelope.NewError(envelope.PermissionError, u.i18n.T("status.deniedPermission"), nil)
+	}
+
+	var mediaCount, mediaBytes int64
+	if err := tx.Stmtx(u.q.GetMergeMediaUsage).QueryRow(pq.Array([]int{visitorID, contactID})).Scan(&mediaCount, &mediaBytes); err != nil {
+		u.lo.Error("error checking media quota for visitor merge", "error", err)
+		return envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	if !mediamanager.OwnedMediaUsageWithinLimits(mediaCount, mediaBytes) {
+		return envelope.NewErrorWithCode(envelope.InputError, 413, "Persistent upload quota exceeded", nil)
+	}
+
+	mergeSteps := []*sqlx.Stmt{
+		u.q.TransferVisitorConversations,
+		u.q.TransferVisitorMessages,
+		u.q.DeleteDuplicateVisitorParticipants,
+		u.q.TransferVisitorParticipants,
+		u.q.TransferVisitorNotes,
+		u.q.TransferVisitorMedia,
+	}
+	for _, step := range mergeSteps {
+		if _, err := tx.Stmtx(step).Exec(visitorID, contactID); err != nil {
+			u.lo.Error("error merging visitor data to contact", "visitor_id", visitorID, "contact_id", contactID, "error", err)
+			return envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+		}
+	}
+	result, err := tx.Stmtx(u.q.DeleteMergedVisitor).Exec(visitorID)
+	if err != nil {
+		u.lo.Error("error deleting merged visitor", "visitor_id", visitorID, "error", err)
+		return envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return envelope.NewError(envelope.ConflictError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	if err := tx.Commit(); err != nil {
+		u.lo.Error("error committing visitor merge", "error", err)
+		return envelope.NewError(envelope.GeneralError, u.i18n.T("globals.messages.somethingWentWrong"), nil)
 	}
 	return nil
 }
@@ -586,7 +745,15 @@ func promptAndHashPassword(ctx context.Context) ([]byte, error) {
 
 // updateSystemUserPassword updates the password of the system user in the database.
 func updateSystemUserPassword(db *sqlx.DB, hashedPassword []byte) error {
-	_, err := db.Exec(`UPDATE users SET password = $1 WHERE email = $2`, hashedPassword, models.SystemUserEmail)
+	_, err := db.Exec(`
+		UPDATE users
+		SET password = $1,
+			session_version = session_version + 1,
+			api_key = NULL,
+			api_secret = NULL,
+			api_key_last_used_at = NULL,
+			updated_at = now()
+		WHERE email = $2`, hashedPassword, models.SystemUserEmail)
 	if err != nil {
 		return fmt.Errorf("failed to update system user password: %v", err)
 	}
@@ -610,11 +777,25 @@ func (u *Manager) makeUserListQuery(page, pageSize int, userTypes []string, orde
 
 // verifyPassword compares the provided password with the stored password hash.
 func (u *Manager) verifyPassword(pwd []byte, pwdHash string) error {
+	if pwdHash == "" {
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, pwd)
+		return bcrypt.ErrMismatchedHashAndPassword
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(pwdHash), pwd); err != nil {
-		u.lo.Error("error verifying password", "error", err)
+		if !errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			u.lo.Error("error verifying password hash", "error", err)
+		}
 		return fmt.Errorf("error verifying password: %w", err)
 	}
 	return nil
+}
+
+func mustDummyPasswordHash() []byte {
+	hash, err := bcrypt.GenerateFromPassword([]byte("NotARealPassword1!"), bcrypt.DefaultCost)
+	if err != nil {
+		panic(err)
+	}
+	return hash
 }
 
 // generatePassword generates a random password and returns its bcrypt hash.

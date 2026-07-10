@@ -90,6 +90,7 @@ CREATE TABLE inboxes (
 	"from" TEXT NULL,
 	from_name_template TEXT NOT NULL DEFAULT '',
 	secret TEXT NULL,
+	widget_session_version BIGINT DEFAULT 1 NOT NULL,
 	linked_email_inbox_id INT REFERENCES inboxes(id) ON DELETE SET NULL,
 	CONSTRAINT constraint_inboxes_on_name CHECK (length("name") <= 140)
 );
@@ -145,8 +146,10 @@ CREATE TABLE users (
     avatar_url TEXT NULL,
 	custom_attributes JSONB DEFAULT '{}'::jsonb NOT NULL,
 	external_user_id TEXT NULL,
-    reset_password_token TEXT NULL,
-    reset_password_token_expiry TIMESTAMPTZ NULL,
+	reset_password_token TEXT NULL,
+	reset_password_token_expiry TIMESTAMPTZ NULL,
+	session_version BIGINT DEFAULT 1 NOT NULL,
+	portal_registered BOOL DEFAULT FALSE NOT NULL,
 	availability_status user_availability_status DEFAULT 'offline' NOT NULL,
 	last_active_at TIMESTAMPTZ NULL,
 	last_login_at TIMESTAMPTZ NULL,
@@ -172,6 +175,22 @@ CREATE UNIQUE INDEX index_unique_users_on_ext_id_when_type_is_contact
 CREATE UNIQUE INDEX index_unique_users_on_email_when_no_ext_id_contact
 	ON users (email)
 	WHERE type = 'contact' AND deleted_at IS NULL AND external_user_id IS NULL;
+
+DROP TABLE IF EXISTS customer_portal_registrations CASCADE;
+CREATE TABLE customer_portal_registrations (
+	id BIGSERIAL PRIMARY KEY,
+	created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+	updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+	email TEXT NOT NULL UNIQUE,
+	first_name TEXT NOT NULL,
+	last_name TEXT NOT NULL DEFAULT '',
+	token_hash CHAR(64) NOT NULL UNIQUE,
+	expires_at TIMESTAMPTZ NOT NULL,
+	CONSTRAINT constraint_customer_portal_registrations_email CHECK (LENGTH(email) <= 320),
+	CONSTRAINT constraint_customer_portal_registrations_first_name CHECK (LENGTH(first_name) <= 140),
+	CONSTRAINT constraint_customer_portal_registrations_last_name CHECK (LENGTH(last_name) <= 140)
+);
+CREATE INDEX index_customer_portal_registrations_expires_at ON customer_portal_registrations(expires_at);
 
 DROP TABLE IF EXISTS user_roles CASCADE;
 CREATE TABLE user_roles (
@@ -419,6 +438,24 @@ CREATE TABLE oidc (
 	CONSTRAINT constraint_oidc_on_name CHECK (length("name") <= 140)
 );
 
+DROP TABLE IF EXISTS oidc_user_identities CASCADE;
+CREATE TABLE oidc_user_identities (
+	id BIGSERIAL PRIMARY KEY,
+	created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+	last_seen_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+	provider_id INT REFERENCES oidc(id) ON DELETE CASCADE ON UPDATE CASCADE NOT NULL,
+	issuer TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	user_id BIGINT REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE NOT NULL,
+	email_at_link TEXT NOT NULL,
+	CONSTRAINT constraint_oidc_identity_issuer CHECK (LENGTH(issuer) <= 2048),
+	CONSTRAINT constraint_oidc_identity_subject CHECK (LENGTH(subject) <= 512),
+	CONSTRAINT constraint_oidc_identity_email CHECK (LENGTH(email_at_link) <= 320),
+	UNIQUE (issuer, subject),
+	UNIQUE (provider_id, user_id)
+);
+CREATE INDEX index_oidc_user_identities_user_id ON oidc_user_identities(user_id);
+
 DROP TABLE IF EXISTS settings CASCADE;
 CREATE TABLE settings (
 	updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -497,7 +534,7 @@ CREATE TABLE csat_responses (
     CONSTRAINT constraint_csat_responses_on_feedback CHECK (length(feedback) <= 1000)
 );
 CREATE INDEX index_csat_responses_on_uuid ON csat_responses(uuid);
-CREATE INDEX index_csat_responses_on_conversation_id ON csat_responses(conversation_id);
+CREATE UNIQUE INDEX index_unique_csat_responses_on_conversation_id ON csat_responses(conversation_id);
 
 DROP TABLE IF EXISTS views CASCADE;
 CREATE TABLE views (
@@ -725,7 +762,7 @@ VALUES
     ('app.site_name', '"libredesk"'::jsonb),
     ('app.favicon_url', '"http://localhost:9000/favicon.ico"'::jsonb),
 	('app.max_file_upload_size', '20'::jsonb),
-	('app.allowed_file_upload_extensions', '["*"]'::jsonb),
+	('app.allowed_file_upload_extensions', '["jpg","jpeg","png","gif","pdf","txt","csv","doc","docx","xls","xlsx","ppt","pptx"]'::jsonb),
 	('app.timezone', '"Asia/Kolkata"'::jsonb),
 	('app.business_hours_id', '""'::jsonb),
 	('app.public_ticket_require_login', 'true'::jsonb),
@@ -766,7 +803,7 @@ VALUES
 	(
 		'Agent',
 		'Role for all agents with limited access to conversations.',
-		'{conversations:read_all,conversations:read_unassigned,conversations:read_assigned,conversations:read_team_inbox,conversations:read_team_all,conversations:read,conversations:update_user_assignee,conversations:update_team_assignee,conversations:update_priority,conversations:update_status,conversations:update_tags,messages:read,messages:write,view:manage}'
+		'{conversations:read_unassigned,conversations:read_assigned,conversations:read_team_inbox,conversations:read_team_all,conversations:read,conversations:update_user_assignee,conversations:update_team_assignee,conversations:update_priority,conversations:update_status,conversations:update_tags,messages:read,messages:write,view:manage}'
 	);
 
 INSERT INTO
@@ -775,7 +812,7 @@ VALUES
 	(
 		'Admin',
 		'Role for users who have complete access to everything.',
-		'{webhooks:manage,context_links:manage,activity_logs:manage,custom_attributes:manage,contacts:read_all,contacts:read,contacts:write,contacts:block,contact_notes:read,contact_notes:write,contact_notes:delete,conversations:write,ai:manage,general_settings:manage,notification_settings:manage,oidc:manage,conversations:read_all,conversations:read_unassigned,conversations:read_assigned,conversations:read_team_inbox,conversations:read_team_all,conversations:read,conversations:update_user_assignee,conversations:update_team_assignee,conversations:update_priority,conversations:update_status,conversations:update_tags,messages:read,messages:write,view:manage,shared_views:manage,status:manage,tags:manage,macros:manage,users:manage,teams:manage,automations:manage,inboxes:manage,roles:manage,reports:manage,templates:manage,business_hours:manage,sla:manage}'
+		'{webhooks:manage,context_links:manage,activity_logs:manage,custom_attributes:manage,contacts:read_all,contacts:read,contacts:write,contacts:block,contact_notes:read,contact_notes:write,contact_notes:delete,conversations:write,ai:manage,general_settings:manage,notification_settings:manage,oidc:manage,conversations:read_all,conversations:read_unassigned,conversations:read_assigned,conversations:read_team_inbox,conversations:read_team_all,conversations:read,conversations:update_user_assignee,conversations:update_team_assignee,conversations:update_priority,conversations:update_status,conversations:update_tags,messages:read,messages:write,messages:write_as_contact,view:manage,shared_views:manage,status:manage,tags:manage,macros:manage,users:manage,teams:manage,automations:manage,inboxes:manage,roles:manage,reports:manage,templates:manage,business_hours:manage,sla:manage}'
 	);
 
 
@@ -869,7 +906,6 @@ $email_reply_template$,
   NULL,
   false
 );
-
 
 -- Email notification templates
 INSERT INTO templates
