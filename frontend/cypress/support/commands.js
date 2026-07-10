@@ -29,12 +29,26 @@
 Cypress.Commands.add('login', () => {
   const email = 'System'
   const password = Cypress.env('SYSTEM_PASSWORD') || 'StrongPass!123'
+
+  // The production default is zh-CN, while this end-to-end journey asserts
+  // the upstream English labels. Keep the test locale deterministic without
+  // changing the application's persisted language setting.
+  cy.intercept('GET', '**/api/v1/config', (req) => {
+    req.continue((res) => {
+      if (res.body?.data) {
+        res.body.data['app.lang'] = 'en-US'
+      }
+    })
+  })
+
   cy.session(
     'system-agent',
     () => {
       cy.visit('/')
-      cy.get('#email').clear().type(email)
-      cy.get('#password').clear().type(password, { log: false })
+      cy.get('#email').clear()
+      cy.get('#email').type(email)
+      cy.get('#password').clear()
+      cy.get('#password').type(password, { log: false })
       cy.contains('button', 'Sign in').click()
       cy.url().should('include', '/inboxes')
     },
