@@ -97,7 +97,7 @@ func enforceRequestBodyPolicy(next fasthttp.RequestHandler, maxConfiguredBodySiz
 		}
 
 		contentLength := ctx.Request.Header.ContentLength()
-		if contentLength < 0 {
+		if contentLength < 0 && requestRequiresContentLength(&ctx.Request.Header) {
 			fail(fasthttp.StatusLengthRequired, "Content-Length is required")
 			return
 		}
@@ -112,6 +112,21 @@ func enforceRequestBodyPolicy(next fasthttp.RequestHandler, maxConfiguredBodySiz
 			ctx.Response.Header.SetConnectionClose()
 			_ = ctx.Request.CloseBodyStream()
 		}
+	}
+}
+
+func requestRequiresContentLength(header *fasthttp.RequestHeader) bool {
+	if header == nil {
+		return true
+	}
+	if len(bytes.TrimSpace(header.Peek("Transfer-Encoding"))) > 0 {
+		return true
+	}
+	switch string(header.Method()) {
+	case fasthttp.MethodPost, fasthttp.MethodPut, fasthttp.MethodPatch:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -84,24 +84,30 @@ func TestRequestHeaderConfigClampsUploadAndSetsReadDeadline(t *testing.T) {
 func TestEnforceRequestBodyPolicy(t *testing.T) {
 	tests := []struct {
 		name          string
+		method        string
 		contentLength int
 		encoding      string
 		wantStatus    int
 		wantCalled    bool
 	}{
-		{name: "allowed upload", contentLength: 1 << 20, wantStatus: fasthttp.StatusNoContent, wantCalled: true},
-		{name: "oversized upload", contentLength: maxMediaMultipartBodyBytes + 1, wantStatus: fasthttp.StatusRequestEntityTooLarge},
-		{name: "chunked upload", contentLength: -1, wantStatus: fasthttp.StatusLengthRequired},
-		{name: "compressed upload", contentLength: 1024, encoding: "gzip", wantStatus: fasthttp.StatusUnsupportedMediaType},
+		{name: "allowed upload", method: fasthttp.MethodPost, contentLength: 1 << 20, wantStatus: fasthttp.StatusNoContent, wantCalled: true},
+		{name: "oversized upload", method: fasthttp.MethodPost, contentLength: maxMediaMultipartBodyBytes + 1, wantStatus: fasthttp.StatusRequestEntityTooLarge},
+		{name: "chunked upload", method: fasthttp.MethodPost, contentLength: -1, wantStatus: fasthttp.StatusLengthRequired},
+		{name: "compressed upload", method: fasthttp.MethodPost, contentLength: 1024, encoding: "gzip", wantStatus: fasthttp.StatusUnsupportedMediaType},
+		{name: "bodyless get", method: fasthttp.MethodGet, wantStatus: fasthttp.StatusNoContent, wantCalled: true},
+		{name: "bodyless head", method: fasthttp.MethodHead, wantStatus: fasthttp.StatusNoContent, wantCalled: true},
+		{name: "chunked get", method: fasthttp.MethodGet, contentLength: -1, wantStatus: fasthttp.StatusLengthRequired},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := &fasthttp.RequestCtx{}
-			ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+			ctx.Request.Header.SetMethod(tt.method)
 			ctx.Request.Header.SetRequestURI("/api/v1/media")
 			ctx.Request.Header.SetContentType("multipart/form-data; boundary=test")
-			ctx.Request.Header.SetContentLength(tt.contentLength)
+			if tt.contentLength != 0 {
+				ctx.Request.Header.SetContentLength(tt.contentLength)
+			}
 			if tt.encoding != "" {
 				ctx.Request.Header.Set("Content-Encoding", tt.encoding)
 			}
