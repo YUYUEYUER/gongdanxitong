@@ -42,8 +42,9 @@ func TestCustomerRegistrationQueriesEnforceAtomicHashedActivation(t *testing.T) 
 	require.Contains(t, queries, "ORDER BY id\nFOR UPDATE")
 	require.Contains(t, queries, "-- name: delete-merged-visitor")
 	require.Contains(t, queries, "-- name: delete-duplicate-visitor-participants")
-	require.Contains(t, queries, "enabled IS DISTINCT FROM $8")
-	require.Contains(t, queries, "$7 IS NOT NULL OR $8 = false")
+	require.Contains(t, queries, "enabled IS DISTINCT FROM $8::boolean")
+	require.Contains(t, queries, "$7 IS NOT NULL OR $8::boolean = false")
+	require.Contains(t, queries, "enabled = COALESCE($8::boolean, enabled)")
 	require.NotContains(t, strings.ToLower(queries), "where token = $1")
 }
 

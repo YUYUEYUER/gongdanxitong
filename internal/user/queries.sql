@@ -101,14 +101,14 @@ SET first_name = COALESCE($2, first_name),
  avatar_url = COALESCE($6, avatar_url), 
  password = COALESCE($7, password),
  session_version = CASE
-   WHEN $7 IS NOT NULL OR ($8 IS NOT NULL AND enabled IS DISTINCT FROM $8)
+   WHEN $7 IS NOT NULL OR ($8::boolean IS NOT NULL AND enabled IS DISTINCT FROM $8::boolean)
    THEN session_version + 1 ELSE session_version END,
- api_key = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE api_key END,
- api_secret = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE api_secret END,
- api_key_last_used_at = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE api_key_last_used_at END,
- reset_password_token = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE reset_password_token END,
- reset_password_token_expiry = CASE WHEN $7 IS NOT NULL OR $8 = false THEN NULL ELSE reset_password_token_expiry END,
- enabled = COALESCE($8, enabled),
+ api_key = CASE WHEN $7 IS NOT NULL OR $8::boolean = false THEN NULL ELSE api_key END,
+ api_secret = CASE WHEN $7 IS NOT NULL OR $8::boolean = false THEN NULL ELSE api_secret END,
+ api_key_last_used_at = CASE WHEN $7 IS NOT NULL OR $8::boolean = false THEN NULL ELSE api_key_last_used_at END,
+ reset_password_token = CASE WHEN $7 IS NOT NULL OR $8::boolean = false THEN NULL ELSE reset_password_token END,
+ reset_password_token_expiry = CASE WHEN $7 IS NOT NULL OR $8::boolean = false THEN NULL ELSE reset_password_token_expiry END,
+ enabled = COALESCE($8::boolean, enabled),
  availability_status = COALESCE($9, availability_status),
  updated_at = now()
 WHERE id = $1;

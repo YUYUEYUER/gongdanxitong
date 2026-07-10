@@ -47,6 +47,7 @@ services:
       - -ec
       - |
         /libredesk/libredesk --install --idempotent-install --yes --config /libredesk/config.toml
+        /libredesk/libredesk --upgrade --yes --config /libredesk/config.toml
         exec /libredesk/libredesk --config /libredesk/config.toml
 
   # PostgreSQL database
